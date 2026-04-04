@@ -13,6 +13,7 @@ import os
 import threading
 import queue
 import sys
+import traceback
 from multiprocessing import Value
 import nvtx
 
@@ -246,63 +247,64 @@ class SLMServer:
         min_batch_size: Union[int, list[int]] = 1,
         master_port: Optional[int] = None,
     ):
-        # Register signal handler to ensure finally block execution on terminate
-        def _worker_sig_handler(signum, frame):
-            sys.exit(0)
-        signal.signal(signal.SIGTERM, _worker_sig_handler)
-        
-        # Set MASTER_ADDR and MASTER_PORT inside worker
-        os.environ["MASTER_ADDR"] = "localhost"
-        if master_port is not None:
-            os.environ["MASTER_PORT"] = str(master_port)
-        elif "MASTER_PORT" not in os.environ:
-            raise RuntimeError("MASTER_PORT must be provided or set in environment")
-        
-        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank)
-
-        port_args = PortArgs.init_new(server_args)
-        scheduler = Scheduler(
-            server_args=server_args,
-            port_args=port_args,
-            gpu_id=rank,
-            tp_rank=rank,
-            dp_rank=0,
-            moe_ep_rank=0,
-            pp_rank=0, # Pipeline parallelism is not Supported
-            llm_kvcache_size=llm_kvcache_size,
-            min_batch_size=min_batch_size,
-        )
-        # Setup system SUB socket on rank 0
-        if req_port is not None:
-            ctx = zmq.Context.instance()
-            sub_socket = ctx.socket(zmq.SUB)
-            sub_socket.setsockopt(zmq.LINGER, 0)
-            sub_socket.connect(f"tcp://127.0.0.1:{req_port}")
-            sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
-            poller = zmq.Poller()
-            poller.register(sub_socket, zmq.POLLIN)
-            scheduler.receive_from_system = sub_socket
-        else:
-            scheduler.receive_from_system = None
-
-        # Initialize switching strategy
-        router = create_switching_strategy(switching_strategy, **strategy_kwargs)
-
-        # Notify readiness after subscription
-        if ready_queue is not None:
-            try:
-                ready_queue.put(("READY", rank, scheduler.tokenizer if rank == 0 else None))
-            except Exception as e:
-                print(f"SLMServer Failed to send tokenizer from rank {rank}: {e}")
-
-        print(f"Quick model worker {rank} started, waiting for requests...")
-
-        SLMServer.init_batch_not_need(scheduler)
-        pbar_dict = {}
-
-        # event_loop
+        scheduler = None
         try:
+            # Register signal handler to ensure finally block execution on terminate
+            def _worker_sig_handler(signum, frame):
+                sys.exit(0)
+            signal.signal(signal.SIGTERM, _worker_sig_handler)
+
+            # Set MASTER_ADDR and MASTER_PORT inside worker
+            os.environ["MASTER_ADDR"] = "localhost"
+            if master_port is not None:
+                os.environ["MASTER_PORT"] = str(master_port)
+            elif "MASTER_PORT" not in os.environ:
+                raise RuntimeError("MASTER_PORT must be provided or set in environment")
+
+            dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+            torch.cuda.set_device(rank)
+
+            port_args = PortArgs.init_new(server_args)
+            scheduler = Scheduler(
+                server_args=server_args,
+                port_args=port_args,
+                gpu_id=rank,
+                tp_rank=rank,
+                dp_rank=0,
+                moe_ep_rank=0,
+                pp_rank=0, # Pipeline parallelism is not Supported
+                llm_kvcache_size=llm_kvcache_size,
+                min_batch_size=min_batch_size,
+            )
+            # Setup system SUB socket on rank 0
+            if req_port is not None:
+                ctx = zmq.Context.instance()
+                sub_socket = ctx.socket(zmq.SUB)
+                sub_socket.setsockopt(zmq.LINGER, 0)
+                sub_socket.connect(f"tcp://127.0.0.1:{req_port}")
+                sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
+                poller = zmq.Poller()
+                poller.register(sub_socket, zmq.POLLIN)
+                scheduler.receive_from_system = sub_socket
+            else:
+                scheduler.receive_from_system = None
+
+            # Initialize switching strategy
+            router = create_switching_strategy(switching_strategy, **strategy_kwargs)
+
+            # Notify readiness after subscription
+            if ready_queue is not None:
+                try:
+                    ready_queue.put(("READY", rank, scheduler.tokenizer if rank == 0 else None))
+                except Exception as e:
+                    print(f"SLMServer Failed to send tokenizer from rank {rank}: {e}")
+
+            print(f"Quick model worker {rank} started, waiting for requests...")
+
+            SLMServer.init_batch_not_need(scheduler)
+            pbar_dict = {}
+
+            # event_loop
             while True:
                 init_nvtx = False
                 if inbound_queue is not None: # Process message from LLM
@@ -338,6 +340,17 @@ class SLMServer:
                     if rank == 0:
                         SLMServer.update_tqdm(pbar_dict, batch, scheduler)
                     nvtx.pop_range()
+        except (SystemExit, KeyboardInterrupt):
+            pass
+        except BaseException as e:
+            tb = traceback.format_exc()
+            print(f"[quick rank {rank}] fatal error during worker lifecycle: {e}")
+            print(tb)
+            if ready_queue is not None:
+                try:
+                    ready_queue.put(("ERROR", rank, tb))
+                except Exception:
+                    pass
         finally:
             try:
                 if dist.is_initialized():
@@ -466,13 +479,16 @@ class SLMServer:
                 if req.rid in returned_rid_list:
                     llm_result = llm_results[req.rid]
                     final_token_id = int(llm_result.new_token_ids[-1])
-                    source_model = "reference"
+                    source_model = getattr(llm_result, "final_token_source", None) or "reference"
 
                     if getattr(router, "requires_reference_evaluation", False):
                         quick_token_id = getattr(req, "r2r_quick_token_id", None)
                         distribution_mode = getattr(req, "r2r_reference_logits_mode", None)
+                        decision_mode = getattr(req, "r2r_reference_decision_mode", None)
 
-                        if distribution_mode == "full":
+                        if decision_mode in {"llm_sparse_js", "llm_full_js"}:
+                            pass
+                        elif distribution_mode == "full":
                             quick_logits = getattr(req, "r2r_quick_logits", None)
                             ref_logits = llm_result.reference_logits
                             if (
@@ -521,6 +537,8 @@ class SLMServer:
                             "r2r_quick_topk_logits",
                             "r2r_reference_logits_mode",
                             "r2r_reference_topk_k",
+                            "r2r_reference_decision_mode",
+                            "r2r_reference_js_threshold",
                         ):
                             if hasattr(req, attr_name):
                                 delattr(req, attr_name)
@@ -755,7 +773,7 @@ class SLMServer:
             reference_request = (
                 router.get_reference_distribution_request()
                 if getattr(router, "requires_reference_evaluation", False)
-                else {"mode": None, "topk_k": None}
+                else {"mode": None, "topk_k": None, "decision_mode": None, "js_threshold": None}
             )
             for i, req in enumerate(batch.reqs):
                 if model_choices[i] == 1:
@@ -763,6 +781,8 @@ class SLMServer:
                     req.status = "notneed"
                     req.r2r_reference_logits_mode = reference_request.get("mode")
                     req.r2r_reference_topk_k = reference_request.get("topk_k")
+                    req.r2r_reference_decision_mode = reference_request.get("decision_mode")
+                    req.r2r_reference_js_threshold = reference_request.get("js_threshold")
                     if getattr(router, "requires_reference_evaluation", False):
                         req.r2r_quick_token_id = int(next_token_ids[i].item())
                         if reference_request.get("mode") == "full":
@@ -772,8 +792,12 @@ class SLMServer:
                                 logits[i, 0].detach(),
                                 reference_request.get("topk_k") or 64,
                             )
-                            req.r2r_quick_topk_indices = quick_topk_indices.cpu()
-                            req.r2r_quick_topk_logits = quick_topk_logits.cpu()
+                            if reference_request.get("decision_mode") == "llm_sparse_js":
+                                quick_topk_indices_cpu = quick_topk_indices.cpu()
+                                quick_topk_logits_cpu = quick_topk_logits.cpu()
+                            else:
+                                req.r2r_quick_topk_indices = quick_topk_indices.cpu()
+                                req.r2r_quick_topk_logits = quick_topk_logits.cpu()
                     new_token_ids = []
                     if req.last_llm_loc is None:
                         req.last_llm_loc = 0
@@ -791,7 +815,24 @@ class SLMServer:
                             ),
                         reference_logits_mode=reference_request.get("mode"),
                         reference_topk_k=reference_request.get("topk_k"),
+                        reference_decision_mode=reference_request.get("decision_mode"),
+                        reference_js_threshold=reference_request.get("js_threshold"),
                         )
+                    if (
+                        getattr(router, "requires_reference_evaluation", False)
+                        and reference_request.get("mode") == "full"
+                        and reference_request.get("decision_mode") == "llm_full_js"
+                    ):
+                        waiting_req.quick_logits = logits[i, 0].detach().cpu()
+                        waiting_req.quick_token_id = int(next_token_ids[i].item())
+                    if (
+                        getattr(router, "requires_reference_evaluation", False)
+                        and reference_request.get("mode") == "topk"
+                        and reference_request.get("decision_mode") == "llm_sparse_js"
+                    ):
+                        waiting_req.quick_token_id = int(next_token_ids[i].item())
+                        waiting_req.quick_topk_indices = quick_topk_indices_cpu
+                        waiting_req.quick_topk_logits = quick_topk_logits_cpu
                     req_to_send.append(waiting_req)
         return result, req_to_send
 

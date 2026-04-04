@@ -55,7 +55,18 @@ def get_mem_fraction_statics(
     reference_num_gpus: int = 1
 ) -> Tuple[float, float]:
     if not overlap_tp_schedule:
-        return 0.9, 0.9
+        quick_mem_fraction_static = float(
+            model_config.get("quick", {}).get("mem_fraction_static", 0.9)
+        )
+        reference_mem_fraction_static = float(
+            model_config.get("reference", {}).get("mem_fraction_static", 0.9)
+        )
+        print(
+            "[SLDisaggregationSystem] overlap_tp_schedule=False, using configured "
+            f"mem_fraction_static: quick model {quick_mem_fraction_static:.2f}, "
+            f"reference model {reference_mem_fraction_static:.2f}"
+        )
+        return quick_mem_fraction_static, reference_mem_fraction_static
 
     small_server_args = ServerArgs(
         model_path=model_config["quick"]["model_path"],
@@ -196,6 +207,8 @@ class SLDisaggregationSystem:
         # Compute MASTER_PORT once in the main process and pass to workers
         self.slm_master_port = find_free_port()
         print(f"[SLDisaggregationSystem] SLM MASTER_ADDR: localhost, MASTER_PORT: {self.slm_master_port}")
+        self.slm_startup_timeout = int(os.environ.get("R2R_SLM_STARTUP_TIMEOUT_SEC", "300"))
+        self.llm_startup_timeout = int(os.environ.get("R2R_LLM_STARTUP_TIMEOUT_SEC", "300"))
 
         small_mem_fraction_static, large_mem_fraction_static = get_mem_fraction_statics(
             model_config=self.model_config,
@@ -238,7 +251,11 @@ class SLDisaggregationSystem:
             got = 0
             tok = None
             while got < self.quick_num_gpus:
-                msg, rank, payload = self._quick_ready_queue.get(timeout=120)
+                msg, rank, payload = self._quick_ready_queue.get(timeout=self.slm_startup_timeout)
+                if msg == "ERROR":
+                    raise RuntimeError(
+                        f"SLM worker rank {rank} failed during startup:\n{payload}"
+                    )
                 if msg != "READY":
                     raise RuntimeError(f"unexpected ready msg: {msg}")
                 if tok is None and payload is not None:
@@ -247,7 +264,10 @@ class SLDisaggregationSystem:
             assert tok is not None, "Failed to get tokenizer from quick model scheduler"
             self.tokenizer = tok
         except Exception as e:
-            raise RuntimeError("Waiting for SLMServer launching or Failed to get tokenizer from scheduler") from e
+            raise RuntimeError(
+                "Waiting for SLMServer launching or failed to get tokenizer from scheduler "
+                f"within {self.slm_startup_timeout}s"
+            ) from e
 
 
         # Launch reference model workers
@@ -270,13 +290,17 @@ class SLDisaggregationSystem:
             got_llm = 0
             ref_tok = None
             while got_llm < self.reference_num_gpus:
-                ready_msg = self._llm_ready_queue.get(timeout=300)
+                ready_msg = self._llm_ready_queue.get(timeout=self.llm_startup_timeout)
                 # Compatible with formats: (msg, rank) or (msg, rank, tokenizer)
                 if len(ready_msg) == 2:
                     msg, rank = ready_msg
                     tk = None
                 else:
                     msg, rank, tk = ready_msg
+                if msg == "ERROR":
+                    raise RuntimeError(
+                        f"Reference worker rank {rank} failed during startup:\n{tk}"
+                    )
                 if msg != "READY":
                     raise RuntimeError(f"unexpected llm ready msg: {msg}")
                 if ref_tok is None and tk is not None:
@@ -288,7 +312,10 @@ class SLDisaggregationSystem:
             self._llm_all_ready = True
             print(f"[SLDisaggregationSystem] llm READY={got_llm}")
         except Exception as e:
-            raise RuntimeError("Waiting for reference model workers launching failed") from e
+            raise RuntimeError(
+                "Waiting for reference model workers launching failed "
+                f"within {self.llm_startup_timeout}s"
+            ) from e
 
         if self.tokenizer is None:
             self.tokenizer = self.reference_tokenizer

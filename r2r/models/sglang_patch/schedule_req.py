@@ -26,8 +26,15 @@ class WaitingReq:
         reference_logits=None,
         reference_logits_mode: Optional[str] = None,
         reference_topk_k: Optional[int] = None,
+        reference_decision_mode: Optional[str] = None,
+        reference_js_threshold: Optional[float] = None,
         reference_topk_indices=None,
         reference_topk_logits=None,
+        quick_logits=None,
+        quick_token_id: Optional[int] = None,
+        quick_topk_indices=None,
+        quick_topk_logits=None,
+        final_token_source: Optional[str] = None,
     ):
         self.rid = rid
         self.new_token_ids = new_token_ids
@@ -36,5 +43,12 @@ class WaitingReq:
         self.reference_logits = reference_logits
         self.reference_logits_mode = reference_logits_mode
         self.reference_topk_k = reference_topk_k
+        self.reference_decision_mode = reference_decision_mode
+        self.reference_js_threshold = reference_js_threshold
         self.reference_topk_indices = reference_topk_indices
         self.reference_topk_logits = reference_topk_logits
+        self.quick_logits = quick_logits
+        self.quick_token_id = quick_token_id
+        self.quick_topk_indices = quick_topk_indices
+        self.quick_topk_logits = quick_topk_logits
+        self.final_token_source = final_token_source

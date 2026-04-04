@@ -7,9 +7,9 @@ cd "$ROOT_DIR"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export CUDA_VISIBLE_DEVICES
 
-CONFIG_PATH="${CONFIG_PATH:-config/Qwen3-0.6B+Qwen3-8B_entropy_js_topk_sparse.yaml}"
+CONFIG_PATH="${CONFIG_PATH:-config/Qwen3-0.6B+Qwen3-8B_entropy_js_llm.yaml}"
 DATASET="${DATASET:-aime}"
-OUTPUT_DIR="${OUTPUT_DIR:-output/eval/qwen3_0_6b_qwen3_8b_${DATASET}_sparse_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-output/eval/qwen3_0_6b_qwen3_8b_${DATASET}_llm_$(date +%Y%m%d_%H%M%S)}"
 
 SLM_TP_SIZE="${SLM_TP_SIZE:-1}"
 LLM_TP_SIZE="${LLM_TP_SIZE:-1}"
@@ -18,7 +18,6 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
-RESUME="${RESUME:-0}"
 
 cmd=(
   python script/evaluate/hf_dataset_sglang.py
@@ -35,10 +34,6 @@ cmd=(
   --output_dir "$OUTPUT_DIR"
 )
 
-if [[ "$RESUME" == "1" || "$RESUME" == "true" || "$RESUME" == "TRUE" ]]; then
-  cmd+=(--resume)
-fi
-
 if [[ "${OVERLAP_TP_SCHEDULE:-0}" == "1" ]]; then
   cmd+=(--overlap_tp_schedule)
 fi
@@ -51,13 +46,12 @@ if [[ -n "${NUM_PROBLEMS:-}" ]]; then
   cmd+=(--num_problems "$NUM_PROBLEMS")
 fi
 
-echo "Running AIME24+25 sparse top-k evaluation with:"
+echo "Running AIME24+25 full-logits LLM-decision evaluation with:"
 echo "  CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "  CONFIG_PATH=$CONFIG_PATH"
 echo "  DATASET=$DATASET"
 echo "  SLM_TP_SIZE=$SLM_TP_SIZE"
 echo "  LLM_TP_SIZE=$LLM_TP_SIZE"
-echo "  RESUME=$RESUME"
 echo "  OUTPUT_DIR=$OUTPUT_DIR"
 echo
 printf 'Command:'

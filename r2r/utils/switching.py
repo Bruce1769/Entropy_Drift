@@ -33,6 +33,7 @@ class ModelSwitchingStrategy:
     requires_reference_logits = False
     reference_distribution_mode = None
     reference_topk_k = None
+    reference_decision_mode = None
 
     def __init__(self, aleatoric_threshold: float = 2.275):
         self.aleatoric_threshold = aleatoric_threshold
@@ -62,6 +63,12 @@ class ModelSwitchingStrategy:
         return {
             "mode": self.reference_distribution_mode,
             "topk_k": self.reference_topk_k,
+            "decision_mode": self.reference_decision_mode,
+            "js_threshold": (
+                getattr(self, "js_threshold", None)
+                if self.reference_decision_mode is not None
+                else None
+            ),
         }
 
 class ImmediateSwitching(ModelSwitchingStrategy):
@@ -227,6 +234,32 @@ class EntropyJSSwitching(ModelSwitchingStrategy):
         self.state.last_model = "reference" if model_choices.any().item() else "quick"
         return model_choices
 
+class EntropyJSLLMSwitching(EntropyJSSwitching):
+    """Route high-entropy tokens to LLM-side full-logits JS final decision."""
+
+    reference_decision_mode = "llm_full_js"
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        entropy_threshold: Optional[float] = None,
+        js_threshold: Optional[float] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model_path=model_path,
+            entropy_threshold=entropy_threshold,
+            js_threshold=js_threshold,
+            device=device,
+            dtype=dtype,
+            override_init_args=override_init_args,
+            **kwargs,
+        )
+        print("Using entropy_js_llm with LLM-side full JS final decision")
+
 class EntropyJSTopKSparseSwitching(EntropyJSSwitching):
     """Route high-entropy tokens using sparse top-k reference distributions."""
 
@@ -308,6 +341,35 @@ class EntropyJSTopKSparseSwitching(EntropyJSSwitching):
 
         self.state.last_model = "reference" if model_choices.any().item() else "quick"
         return model_choices
+
+
+class EntropyJSTopKLLMSwitching(EntropyJSTopKSparseSwitching):
+    """Route high-entropy tokens to LLM-side sparse top-k JS final decision."""
+
+    reference_decision_mode = "llm_sparse_js"
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        entropy_threshold: Optional[float] = None,
+        js_threshold: Optional[float] = None,
+        js_topk: Optional[int] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model_path=model_path,
+            entropy_threshold=entropy_threshold,
+            js_threshold=js_threshold,
+            js_topk=js_topk,
+            device=device,
+            dtype=dtype,
+            override_init_args=override_init_args,
+            **kwargs,
+        )
+        print("Using entropy_js_topk_llm with LLM-side sparse JS final decision")
 
 class MomentumSwitching(ModelSwitchingStrategy):
     """Momentum-based switching with asymmetric behavior"""
@@ -985,7 +1047,9 @@ def create_switching_strategy(strategy_name: str, **kwargs) -> ModelSwitchingStr
         'immediate': ImmediateSwitching,
         'entropy': EntropySwitching,
         'entropy_js': EntropyJSSwitching,
+        'entropy_js_llm': EntropyJSLLMSwitching,
         'entropy_js_topk_sparse': EntropyJSTopKSparseSwitching,
+        'entropy_js_topk_llm': EntropyJSTopKLLMSwitching,
         'momentum': MomentumSwitching,
         'rolling': SingleRollingWindowSwitching,
         'duo_rolling': DuoRollingWindowSwitching,

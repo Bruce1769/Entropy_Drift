@@ -29,7 +29,11 @@ from r2r.utils.switching import create_switching_strategy
 from r2r.utils.token_manager import SGLangTokenManager
 from r2r.utils.dataclass import ModelOutputs
 from r2r.utils.sampling import sample_token
-from r2r.utils.metrics import extract_topk_logits
+from r2r.utils.metrics import (
+    extract_topk_logits,
+    compute_js_divergence,
+    compute_sparse_topk_js_divergence,
+)
 from r2r.models.sglang_patch.schedule_req import WaitingReq, SimpleSamplingParams
 from r2r.models.sglang_patch.llm_scheduler import LLMScheduler
 
@@ -176,37 +180,38 @@ class LLMServer:
         def _worker_sig_handler(signum, frame):
             sys.exit(0)
         signal.signal(signal.SIGTERM, _worker_sig_handler)
-        # Use a dedicated tcp init_method to avoid port collision with quick model's default 29500 store
-        init_method = f"tcp://127.0.0.1:{master_port}"
-        dist.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=world_size)
-        torch.cuda.set_device(rank + quick_num_gpus)
-
-        port_args = PortArgs.init_new(server_args)
-        scheduler = LLMScheduler(
-            server_args=server_args,
-            port_args=port_args,
-            gpu_id=rank+quick_num_gpus,
-            tp_rank=rank,
-            dp_rank=0,
-            moe_ep_rank=0,
-            pp_rank=0, # Pipeline parallelism is not Supported
-            llm_kvcache_size=llm_kvcache_size,
-            min_batch_size=min_batch_size,
-        )
-        print(f"[reference rank {rank}] attn_tp_rank: {scheduler.attn_tp_rank}")
-        
-        # Signal readiness
-        if ready_queue is not None:
-            try:
-                ready_queue.put(("READY", rank, scheduler.tokenizer if rank == 0 else None))
-            except Exception as e:
-                print(f"[rank {rank}] failed to put READY: {e}")
-        
-        LLMServer.init_batch_not_need(scheduler)
-        print(f"Reference model worker {rank} started, waiting for requests...")
-        
-        # event_loop
+        scheduler = None
         try:
+            # Use a dedicated tcp init_method to avoid port collision with quick model's default 29500 store
+            init_method = f"tcp://127.0.0.1:{master_port}"
+            dist.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=world_size)
+            torch.cuda.set_device(rank + quick_num_gpus)
+
+            port_args = PortArgs.init_new(server_args)
+            scheduler = LLMScheduler(
+                server_args=server_args,
+                port_args=port_args,
+                gpu_id=rank+quick_num_gpus,
+                tp_rank=rank,
+                dp_rank=0,
+                moe_ep_rank=0,
+                pp_rank=0, # Pipeline parallelism is not Supported
+                llm_kvcache_size=llm_kvcache_size,
+                min_batch_size=min_batch_size,
+            )
+            print(f"[reference rank {rank}] attn_tp_rank: {scheduler.attn_tp_rank}")
+            
+            # Signal readiness
+            if ready_queue is not None:
+                try:
+                    ready_queue.put(("READY", rank, scheduler.tokenizer if rank == 0 else None))
+                except Exception as e:
+                    print(f"[rank {rank}] failed to put READY: {e}")
+            
+            LLMServer.init_batch_not_need(scheduler)
+            print(f"Reference model worker {rank} started, waiting for requests...")
+            
+            # event_loop
             while True:
                 if inbound_queue is not None: # Process message from LLM
                     slm_reqs = LLMServer.recv_reqs_from_slm(
@@ -245,8 +250,12 @@ class LLMServer:
         except BaseException as e:
             # Any unexpected error -> exit loop to avoid orphaned NCCL workers
             print(f"[rank {rank}] reference worker fatal error: {e}. Exiting loop.")
-            import traceback
             traceback.print_exc()
+            if ready_queue is not None:
+                try:
+                    ready_queue.put(("ERROR", rank, traceback.format_exc()))
+                except Exception:
+                    pass
         finally:
             try:
                 if dist.is_initialized():
@@ -280,6 +289,12 @@ class LLMServer:
         new_token_ids = {}
         reference_logits_mode = {}
         reference_topk_k = {}
+        reference_decision_mode = {}
+        reference_js_threshold = {}
+        quick_logits = {}
+        quick_token_ids = {}
+        quick_topk_indices = {}
+        quick_topk_logits = {}
         returned_rid_list = []
         finished_rid_list = set()
         if scheduler.batch_not_need is not None:
@@ -290,6 +305,12 @@ class LLMServer:
             new_token_ids[waiting_req.rid] = waiting_req.new_token_ids
             reference_logits_mode[waiting_req.rid] = waiting_req.reference_logits_mode
             reference_topk_k[waiting_req.rid] = waiting_req.reference_topk_k
+            reference_decision_mode[waiting_req.rid] = waiting_req.reference_decision_mode
+            reference_js_threshold[waiting_req.rid] = waiting_req.reference_js_threshold
+            quick_logits[waiting_req.rid] = waiting_req.quick_logits
+            quick_token_ids[waiting_req.rid] = waiting_req.quick_token_id
+            quick_topk_indices[waiting_req.rid] = waiting_req.quick_topk_indices
+            quick_topk_logits[waiting_req.rid] = waiting_req.quick_topk_logits
             returned_rid_list.append(waiting_req.rid)
             if waiting_req.status == "finished":
                 finished_rid_list.add(waiting_req.rid)
@@ -316,6 +337,12 @@ class LLMServer:
                     new_req.device = scheduler.batch_not_need.device
                 new_req.r2r_reference_logits_mode = reference_logits_mode.get(waiting_req.rid)
                 new_req.r2r_reference_topk_k = reference_topk_k.get(waiting_req.rid)
+                new_req.r2r_reference_decision_mode = reference_decision_mode.get(waiting_req.rid)
+                new_req.r2r_reference_js_threshold = reference_js_threshold.get(waiting_req.rid)
+                new_req.r2r_quick_logits = quick_logits.get(waiting_req.rid)
+                new_req.r2r_quick_token_id = quick_token_ids.get(waiting_req.rid)
+                new_req.r2r_quick_topk_indices = quick_topk_indices.get(waiting_req.rid)
+                new_req.r2r_quick_topk_logits = quick_topk_logits.get(waiting_req.rid)
                 scheduler.waiting_queue.append(new_req)
 
         if scheduler.batch_not_need is not None:
@@ -344,6 +371,24 @@ class LLMServer:
                     )
                     new_req.r2r_reference_topk_k = reference_topk_k.get(
                         req.rid, getattr(req, "r2r_reference_topk_k", None)
+                    )
+                    new_req.r2r_reference_decision_mode = reference_decision_mode.get(
+                        req.rid, getattr(req, "r2r_reference_decision_mode", None)
+                    )
+                    new_req.r2r_reference_js_threshold = reference_js_threshold.get(
+                        req.rid, getattr(req, "r2r_reference_js_threshold", None)
+                    )
+                    new_req.r2r_quick_logits = quick_logits.get(
+                        req.rid, getattr(req, "r2r_quick_logits", None)
+                    )
+                    new_req.r2r_quick_token_id = quick_token_ids.get(
+                        req.rid, getattr(req, "r2r_quick_token_id", None)
+                    )
+                    new_req.r2r_quick_topk_indices = quick_topk_indices.get(
+                        req.rid, getattr(req, "r2r_quick_topk_indices", None)
+                    )
+                    new_req.r2r_quick_topk_logits = quick_topk_logits.get(
+                        req.rid, getattr(req, "r2r_quick_topk_logits", None)
                     )
                     scheduler.waiting_queue.append(new_req)
                 else:
@@ -553,24 +598,76 @@ class LLMServer:
             req.status = "notneed"
             logits_mode = getattr(req, "r2r_reference_logits_mode", None)
             topk_k = getattr(req, "r2r_reference_topk_k", None)
+            decision_mode = getattr(req, "r2r_reference_decision_mode", None)
             waiting_req_kwargs = {
                 "reference_logits_mode": logits_mode,
                 "reference_topk_k": topk_k,
+                "reference_decision_mode": decision_mode,
             }
+            final_token_id = int(next_token_id)
+            final_token_source = "reference"
 
             if logits_mode == "full":
-                waiting_req_kwargs["reference_logits"] = reference_logits[i].detach().cpu()
+                if decision_mode == "llm_full_js":
+                    quick_logits = getattr(req, "r2r_quick_logits", None)
+                    quick_token_id = getattr(req, "r2r_quick_token_id", None)
+                    js_threshold = getattr(req, "r2r_reference_js_threshold", None)
+
+                    if (
+                        quick_logits is not None
+                        and quick_token_id is not None
+                        and js_threshold is not None
+                    ):
+                        use_reference = (
+                            compute_js_divergence(
+                                quick_logits[None, :],
+                                reference_logits[i].detach().cpu()[None, :],
+                            )[0].item()
+                            >= float(js_threshold)
+                        )
+                        if not use_reference:
+                            final_token_id = int(quick_token_id)
+                            final_token_source = "quick"
+                    waiting_req_kwargs["final_token_source"] = final_token_source
+                else:
+                    waiting_req_kwargs["reference_logits"] = reference_logits[i].detach().cpu()
             elif logits_mode == "topk":
                 topk_logits, topk_indices = extract_topk_logits(
                     reference_logits[i],
                     topk_k or 64,
                 )
-                waiting_req_kwargs["reference_topk_logits"] = topk_logits.detach().cpu()
-                waiting_req_kwargs["reference_topk_indices"] = topk_indices.detach().cpu()
+                if decision_mode == "llm_sparse_js":
+                    quick_token_id = getattr(req, "r2r_quick_token_id", None)
+                    quick_topk_indices = getattr(req, "r2r_quick_topk_indices", None)
+                    quick_topk_logits = getattr(req, "r2r_quick_topk_logits", None)
+                    js_threshold = getattr(req, "r2r_reference_js_threshold", None)
+
+                    if (
+                        quick_token_id is not None
+                        and quick_topk_indices is not None
+                        and quick_topk_logits is not None
+                        and js_threshold is not None
+                    ):
+                        use_reference = (
+                            compute_sparse_topk_js_divergence(
+                                logits_p=quick_topk_logits[None, :],
+                                indices_p=quick_topk_indices[None, :],
+                                logits_q=topk_logits.detach().cpu()[None, :],
+                                indices_q=topk_indices.detach().cpu()[None, :],
+                            )[0].item()
+                            >= float(js_threshold)
+                        )
+                        if not use_reference:
+                            final_token_id = int(quick_token_id)
+                            final_token_source = "quick"
+                    waiting_req_kwargs["final_token_source"] = final_token_source
+                else:
+                    waiting_req_kwargs["reference_topk_logits"] = topk_logits.detach().cpu()
+                    waiting_req_kwargs["reference_topk_indices"] = topk_indices.detach().cpu()
 
             waiting_req = WaitingReq(
                 rid=req.rid,
-                new_token_ids=[next_token_id],
+                new_token_ids=[final_token_id],
                 sampling_params=None,
                 **waiting_req_kwargs,
             )
