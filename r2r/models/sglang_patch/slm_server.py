@@ -33,6 +33,7 @@ from r2r.utils.switching import create_switching_strategy
 from r2r.utils.token_manager import SGLangTokenManager
 from r2r.utils.dataclass import ModelOutputs
 from r2r.utils.sampling import sample_token
+from r2r.utils.metrics import extract_topk_logits
 from r2r.models.sglang_patch.schedule_req import WaitingReq, SimpleSamplingParams
 
 
@@ -447,12 +448,10 @@ class SLMServer:
         finished_queue: Optional[mp.Queue] = None,
         outbound_queue: Optional[mp.Queue] = None,
     ):
-        better_token_ids = {}
-        reference_logits = {}
+        llm_results = {}
         returned_rid_list = []
         for waiting_req in commit_msgs:
-            better_token_ids[waiting_req.rid] = waiting_req.new_token_ids[-1]
-            reference_logits[waiting_req.rid] = waiting_req.reference_logits
+            llm_results[waiting_req.rid] = waiting_req
             returned_rid_list.append(waiting_req.rid)
         keep_indices = []
         not_keep_indices = []
@@ -465,33 +464,66 @@ class SLMServer:
             output_ids_list = []
             for i, req in enumerate(scheduler.last_batch.reqs):
                 if req.rid in returned_rid_list:
-                    final_token_id = int(better_token_ids[req.rid])
+                    llm_result = llm_results[req.rid]
+                    final_token_id = int(llm_result.new_token_ids[-1])
                     source_model = "reference"
 
-                    if getattr(router, "requires_reference_logits", False):
-                        quick_logits = getattr(req, "r2r_quick_logits", None)
+                    if getattr(router, "requires_reference_evaluation", False):
                         quick_token_id = getattr(req, "r2r_quick_token_id", None)
-                        ref_logits = reference_logits.get(req.rid)
+                        distribution_mode = getattr(req, "r2r_reference_logits_mode", None)
 
-                        if (
-                            quick_logits is not None
-                            and quick_token_id is not None
-                            and ref_logits is not None
+                        if distribution_mode == "full":
+                            quick_logits = getattr(req, "r2r_quick_logits", None)
+                            ref_logits = llm_result.reference_logits
+                            if (
+                                quick_logits is not None
+                                and quick_token_id is not None
+                                and ref_logits is not None
+                            ):
+                                use_reference = (
+                                    router.route_with_reference_logits(
+                                        quick_logits[None, :], ref_logits[None, :]
+                                    )[0].item()
+                                    == 1
+                                )
+                                if not use_reference:
+                                    final_token_id = int(quick_token_id)
+                                    source_model = "quick"
+                        elif distribution_mode == "topk":
+                            quick_topk_indices = getattr(req, "r2r_quick_topk_indices", None)
+                            quick_topk_logits = getattr(req, "r2r_quick_topk_logits", None)
+                            ref_topk_indices = llm_result.reference_topk_indices
+                            ref_topk_logits = llm_result.reference_topk_logits
+                            if (
+                                quick_topk_indices is not None
+                                and quick_topk_logits is not None
+                                and quick_token_id is not None
+                                and ref_topk_indices is not None
+                                and ref_topk_logits is not None
+                            ):
+                                use_reference = (
+                                    router.route_with_reference_topk(
+                                        quick_topk_indices=quick_topk_indices[None, :],
+                                        quick_topk_logits=quick_topk_logits[None, :],
+                                        reference_topk_indices=ref_topk_indices[None, :],
+                                        reference_topk_logits=ref_topk_logits[None, :],
+                                    )[0].item()
+                                    == 1
+                                )
+                                if not use_reference:
+                                    final_token_id = int(quick_token_id)
+                                    source_model = "quick"
+
+                        for attr_name in (
+                            "r2r_quick_logits",
+                            "r2r_quick_token_id",
+                            "r2r_quick_topk_indices",
+                            "r2r_quick_topk_logits",
+                            "r2r_reference_logits_mode",
+                            "r2r_reference_topk_k",
                         ):
-                            use_reference = (
-                                router.route_with_reference_logits(
-                                    quick_logits[None, :], ref_logits[None, :]
-                                )[0].item()
-                                == 1
-                            )
-                            if not use_reference:
-                                final_token_id = int(quick_token_id)
-                                source_model = "quick"
-
-                        if hasattr(req, "r2r_quick_logits"):
-                            delattr(req, "r2r_quick_logits")
-                        if hasattr(req, "r2r_quick_token_id"):
-                            delattr(req, "r2r_quick_token_id")
+                            if hasattr(req, attr_name):
+                                delattr(req, attr_name)
 
                     if final_token_id in scheduler.model_config.hf_eos_token_id:
                         scheduler.abort_request(AbortReq(req.rid))
@@ -507,7 +539,7 @@ class SLMServer:
                     req.status = "need"
                     req.check_finished()
                     if req.finished():
-                        scheduler.tree_cache.cache_finished_req(req)
+                        SLMServer.cache_finished_req_compat(rank, scheduler, req)
                         finished_reqs.append(req)
                     keep_indices.append(i)
                 elif req.status == "need":
@@ -529,6 +561,33 @@ class SLMServer:
             if finished_reqs:
                 for req in finished_reqs:
                     scheduler.issued_reqs.remove(req)
+
+    @staticmethod
+    def cache_finished_req_compat(rank: int, scheduler: Scheduler, req: Req):
+        if req.last_node is None:
+            # Routed requests can bypass the standard decode bookkeeping path.
+            # When that happens, finish cleanup still needs to insert/free KV state,
+            # but the radix cache unlock must degrade to a root-node no-op.
+            if getattr(req, "prefix_indices", None) is None:
+                req.prefix_indices = []
+
+            root_node = getattr(scheduler.tree_cache, "root_node", None)
+            if root_node is None and hasattr(scheduler.tree_cache, "match_prefix"):
+                try:
+                    match_result = scheduler.tree_cache.match_prefix(key=[])
+                    root_node = getattr(match_result, "last_device_node", None)
+                except Exception:
+                    root_node = None
+
+            if root_node is not None:
+                req.last_node = root_node
+                if rank == 0:
+                    print(
+                        f"[quick rank{rank}] req {req.rid} finished with missing last_node; "
+                        "using root-node cleanup fallback"
+                    )
+
+        scheduler.tree_cache.cache_finished_req(req)
     
     @staticmethod
     def simple_prepare_for_extend(batch: ScheduleBatch):
@@ -683,7 +742,7 @@ class SLMServer:
             token=next_token_ids[:, None],
         )
         # Use switching strategy to decide which model to use for each input
-        if getattr(router, "requires_reference_logits", False):
+        if getattr(router, "requires_reference_evaluation", False):
             model_choices = router.get_reference_candidates(model_outputs).cpu()
         else:
             model_choices = router.route(model_outputs).cpu()
@@ -693,13 +752,28 @@ class SLMServer:
         reference_needed = torch.any(model_choices)
         req_to_send = []
         if reference_needed:
+            reference_request = (
+                router.get_reference_distribution_request()
+                if getattr(router, "requires_reference_evaluation", False)
+                else {"mode": None, "topk_k": None}
+            )
             for i, req in enumerate(batch.reqs):
                 if model_choices[i] == 1:
                     # TODO: send origin input to LLM to prefill prefix only
                     req.status = "notneed"
-                    if getattr(router, "requires_reference_logits", False):
-                        req.r2r_quick_logits = logits[i, 0].detach().cpu()
+                    req.r2r_reference_logits_mode = reference_request.get("mode")
+                    req.r2r_reference_topk_k = reference_request.get("topk_k")
+                    if getattr(router, "requires_reference_evaluation", False):
                         req.r2r_quick_token_id = int(next_token_ids[i].item())
+                        if reference_request.get("mode") == "full":
+                            req.r2r_quick_logits = logits[i, 0].detach().cpu()
+                        elif reference_request.get("mode") == "topk":
+                            quick_topk_logits, quick_topk_indices = extract_topk_logits(
+                                logits[i, 0].detach(),
+                                reference_request.get("topk_k") or 64,
+                            )
+                            req.r2r_quick_topk_indices = quick_topk_indices.cpu()
+                            req.r2r_quick_topk_logits = quick_topk_logits.cpu()
                     new_token_ids = []
                     if req.last_llm_loc is None:
                         req.last_llm_loc = 0
@@ -714,7 +788,9 @@ class SLMServer:
                             top_k = req.sampling_params.top_k, 
                             top_p = req.sampling_params.top_p, 
                             max_new_tokens = 1
-                            )
+                            ),
+                        reference_logits_mode=reference_request.get("mode"),
+                        reference_topk_k=reference_request.get("topk_k"),
                         )
                     req_to_send.append(waiting_req)
         return result, req_to_send

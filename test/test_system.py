@@ -127,6 +127,10 @@ def main():
             strategy_kwargs["js_threshold"] = router_config["js_threshold"]
             print(f"Using js threshold from config: {router_config['js_threshold']}")
 
+        if "js_topk" in router_config:
+            strategy_kwargs["js_topk"] = router_config["js_topk"]
+            print(f"Using js top-k from config: {router_config['js_topk']}")
+
     # Initialize SLDisaggregationSystem
     print("\nInitializing SLDisaggregationSystem...")
     generator = SLDisaggregationSystem(

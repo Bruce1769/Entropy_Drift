@@ -390,6 +390,13 @@ def process_with_model(
                 'entropy_threshold': router_config.get("entropy_threshold", 0.45),
                 'js_threshold': router_config.get("js_threshold", 0.2),
             })
+        elif switching_strategy == 'entropy_js_topk_sparse':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'entropy_threshold': router_config.get("entropy_threshold", 0.45),
+                'js_threshold': router_config.get("js_threshold", 0.2),
+                'js_topk': router_config.get("js_topk", 64),
+            })
         elif switching_strategy == 'immediate':
             strategy_kwargs.update({
                 'model_path': router_path,
@@ -405,6 +412,8 @@ def process_with_model(
                 strategy_kwargs["entropy_threshold"] = router_config["entropy_threshold"]
             if "js_threshold" in router_config:
                 strategy_kwargs["js_threshold"] = router_config["js_threshold"]
+            if "js_topk" in router_config:
+                strategy_kwargs["js_topk"] = router_config["js_topk"]
 
         # initialize generator
         kwargs_init = dict()

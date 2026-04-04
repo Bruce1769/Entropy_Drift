@@ -106,6 +106,112 @@ def compute_js_divergence(
 
     return js_divergence.item() if is_single_input else js_divergence
 
+def extract_topk_logits(
+    logits: torch.Tensor, topk: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Extract top-k logits and indices from a logits tensor.
+
+    Args:
+        logits: Unnormalized logits of shape [vocab_size] or [batch_size, vocab_size]
+        topk: Number of top logits to keep
+
+    Returns:
+        Tuple of (topk_logits, topk_indices)
+    """
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+
+    is_single_input = logits.dim() == 1
+    if is_single_input:
+        logits = logits.unsqueeze(0)
+
+    k = min(int(topk), logits.shape[-1])
+    topk_logits, topk_indices = torch.topk(logits, k=k, dim=-1)
+
+    if is_single_input:
+        return topk_logits.squeeze(0), topk_indices.squeeze(0)
+    return topk_logits, topk_indices
+
+def compute_sparse_topk_js_divergence(
+    logits_p: torch.Tensor,
+    indices_p: torch.Tensor,
+    logits_q: torch.Tensor,
+    indices_q: torch.Tensor,
+) -> Union[float, torch.Tensor]:
+    """
+    Calculate sparse top-k JS divergence using the union of two top-k supports.
+
+    Each side is treated as a truncated distribution over its own top-k support and
+    is re-normalized on the union support before computing JS divergence.
+
+    Args:
+        logits_p: Top-k logits for distribution P, shape [k] or [batch_size, k]
+        indices_p: Top-k indices for distribution P, same leading shape as logits_p
+        logits_q: Top-k logits for distribution Q, shape [k] or [batch_size, k]
+        indices_q: Top-k indices for distribution Q, same leading shape as logits_q
+
+    Returns:
+        JS divergence as a scalar (if single input) or tensor of shape [batch_size]
+    """
+    if logits_p.shape != indices_p.shape or logits_q.shape != indices_q.shape:
+        raise ValueError(
+            "Sparse logits and indices must have matching shapes on each side: "
+            f"got {logits_p.shape}/{indices_p.shape} and {logits_q.shape}/{indices_q.shape}"
+        )
+
+    is_single_input = logits_p.dim() == 1
+    if is_single_input:
+        logits_p = logits_p.unsqueeze(0)
+        indices_p = indices_p.unsqueeze(0)
+        logits_q = logits_q.unsqueeze(0)
+        indices_q = indices_q.unsqueeze(0)
+
+    batch_size = logits_p.shape[0]
+    js_values = []
+
+    for i in range(batch_size):
+        p_logits = logits_p[i].to(dtype=torch.float32)
+        p_indices = indices_p[i].to(dtype=torch.long)
+        q_logits = logits_q[i].to(dtype=torch.float32)
+        q_indices = indices_q[i].to(dtype=torch.long)
+
+        combined_indices = torch.cat([p_indices, q_indices], dim=0)
+        union_indices, inverse = torch.unique(combined_indices, sorted=True, return_inverse=True)
+
+        p_positions = inverse[: p_indices.shape[0]]
+        q_positions = inverse[p_indices.shape[0] :]
+
+        p_union_logits = torch.full(
+            (union_indices.shape[0],),
+            float("-inf"),
+            dtype=torch.float32,
+            device=p_logits.device,
+        )
+        q_union_logits = torch.full(
+            (union_indices.shape[0],),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q_logits.device,
+        )
+
+        p_union_logits[p_positions] = p_logits
+        q_union_logits[q_positions] = q_logits
+
+        probs_p = torch.softmax(p_union_logits, dim=-1)
+        probs_q = torch.softmax(q_union_logits, dim=-1)
+        mean_probs = 0.5 * (probs_p + probs_q)
+        log_mean_probs = torch.log(mean_probs.clamp_min(1e-12))
+
+        log_probs_p = torch.log(probs_p.clamp_min(1e-12))
+        log_probs_q = torch.log(probs_q.clamp_min(1e-12))
+        kl_pm = torch.sum(probs_p * (log_probs_p - log_mean_probs))
+        kl_qm = torch.sum(probs_q * (log_probs_q - log_mean_probs))
+        js_values.append(0.5 * (kl_pm + kl_qm))
+
+    js_divergence = torch.stack(js_values)
+    return js_divergence[0].item() if is_single_input else js_divergence
+
 def compute_reliability(logits: torch.Tensor, topk: int = 10) -> Union[float, torch.Tensor]:
     """
     Calculate reliability of the prediction distribution.

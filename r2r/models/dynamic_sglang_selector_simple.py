@@ -19,6 +19,7 @@ from r2r.utils.sampling import sample_token
 from r2r.utils.switching import create_switching_strategy
 from r2r.utils.token_manager import SGLangTokenManager
 from r2r.utils.dataclass import ModelOutputs
+from r2r.utils.metrics import extract_topk_logits
 
 import sglang as sgl
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
@@ -192,10 +193,34 @@ class DynamicSimpleSGLangSelector:
             next_token_ids = result[1] if isinstance(result, tuple) else result
             next_token_ids_list = next_token_ids.tolist()
 
-            output_queue.put({
+            distribution_mode = (
+                getattr(reqs[0], "r2r_reference_logits_mode", None) if reqs else None
+            )
+            distribution_topk_k = (
+                getattr(reqs[0], "r2r_reference_topk_k", None) if reqs else None
+            )
+
+            payload = {
                 "next_token_ids": next_token_ids_list,
-                "logits": logits_output.next_token_logits.cpu() if logits_output is not None else None,
-            })
+                "distribution_mode": distribution_mode,
+                "logits": None,
+                "topk_indices": None,
+                "topk_logits": None,
+            }
+
+            if logits_output is not None:
+                next_token_logits = logits_output.next_token_logits
+                if distribution_mode == "full":
+                    payload["logits"] = next_token_logits.cpu()
+                elif distribution_mode == "topk":
+                    topk_logits, topk_indices = extract_topk_logits(
+                        next_token_logits,
+                        distribution_topk_k or 64,
+                    )
+                    payload["topk_logits"] = topk_logits.cpu()
+                    payload["topk_indices"] = topk_indices.cpu()
+
+            output_queue.put(payload)
 
     def init_model_switching_strategy(self):
         """Initialize or reinitialize the model switching strategy with stored parameters"""
@@ -299,7 +324,8 @@ class DynamicSimpleSGLangSelector:
         input_ids: List[List[int]],
         input_indices: List[int],
         sampling_params: SamplingParams,
-        return_logits: bool = False,
+        return_distribution_mode: Optional[str] = None,
+        return_topk_k: Optional[int] = None,
     ) -> Union[List[int], dict]:
         """
         Extend the input ids using the reference model
@@ -320,6 +346,8 @@ class DynamicSimpleSGLangSelector:
             req.prefix_indices = self.reference_prefix_indices_list[input_indices[i]]
             req.fill_ids = input_id
             req.extend_input_len = len(input_id) - len(self.reference_prefix_indices_list[input_indices[i]])
+            req.r2r_reference_logits_mode = return_distribution_mode
+            req.r2r_reference_topk_k = return_topk_k
             reqs.append(req)
 
         self.reference_model_input_queue.put_nowait(reqs)
@@ -334,10 +362,13 @@ class DynamicSimpleSGLangSelector:
             # else:
             #     self.reference_prefix_indices_list[input_indices[i]].append(self.reference_prefix_indices_list[input_indices[i]][-1] + 1)
 
-        if return_logits:
+        if return_distribution_mode is not None:
             return {
                 "next_token_ids": next_token_ids,
+                "distribution_mode": payload.get("distribution_mode") if isinstance(payload, dict) else None,
                 "logits": payload["logits"][:, None, :] if isinstance(payload, dict) and payload.get("logits") is not None else None,
+                "topk_indices": payload.get("topk_indices") if isinstance(payload, dict) else None,
+                "topk_logits": payload.get("topk_logits") if isinstance(payload, dict) else None,
             }
         return next_token_ids
 
@@ -492,7 +523,7 @@ class DynamicSimpleSGLangSelector:
                 token=next_token_ids[:, None],
             )
 
-            if getattr(self.switching_strategy, "requires_reference_logits", False):
+            if getattr(self.switching_strategy, "requires_reference_evaluation", False):
                 reference_candidates = self.switching_strategy.get_reference_candidates(
                     model_outputs
                 )
@@ -510,24 +541,50 @@ class DynamicSimpleSGLangSelector:
                 reference_indices = torch.where(reference_candidates == 1)[0].tolist()
                 reference_input_ids = token_manager.fetch_active_input_ids(reference_indices)
 
+                reference_request = self.switching_strategy.get_reference_distribution_request()
                 # Generate with reference model for inputs that need it
                 reference_outputs = self.extend_step(
                     input_ids=reference_input_ids,
                     input_indices=reference_indices,
                     sampling_params=reference_sampling_params,
-                    return_logits=getattr(
-                        self.switching_strategy, "requires_reference_logits", False
-                    ),
+                    return_distribution_mode=reference_request.get("mode"),
+                    return_topk_k=reference_request.get("topk_k"),
                 )
 
-                if getattr(self.switching_strategy, "requires_reference_logits", False):
+                if getattr(self.switching_strategy, "requires_reference_evaluation", False):
                     reference_tokens = reference_outputs["next_token_ids"]
-                    if reference_outputs["logits"] is not None:
+                    if reference_request.get("mode") == "full" and reference_outputs["logits"] is not None:
                         full_reference_logits = torch.zeros_like(logits)
                         full_reference_logits[reference_indices] = reference_outputs[
                             "logits"
                         ].to(device=logits.device, dtype=logits.dtype)
                         model_outputs.reference_logits = full_reference_logits
+                        model_choices = self.switching_strategy.route(model_outputs)
+                    elif (
+                        reference_request.get("mode") == "topk"
+                        and reference_outputs.get("topk_indices") is not None
+                        and reference_outputs.get("topk_logits") is not None
+                    ):
+                        sparse_k = reference_outputs["topk_indices"].shape[-1]
+                        full_reference_topk_indices = torch.zeros(
+                            (active_count, sparse_k),
+                            dtype=torch.long,
+                            device=logits.device,
+                        )
+                        full_reference_topk_logits = torch.full(
+                            (active_count, sparse_k),
+                            float("-inf"),
+                            dtype=logits.dtype,
+                            device=logits.device,
+                        )
+                        full_reference_topk_indices[reference_indices] = reference_outputs[
+                            "topk_indices"
+                        ].to(device=logits.device, dtype=torch.long)
+                        full_reference_topk_logits[reference_indices] = reference_outputs[
+                            "topk_logits"
+                        ].to(device=logits.device, dtype=logits.dtype)
+                        model_outputs.reference_topk_indices = full_reference_topk_indices
+                        model_outputs.reference_topk_logits = full_reference_topk_logits
                         model_choices = self.switching_strategy.route(model_outputs)
                     else:
                         model_choices[reference_indices] = 1

@@ -203,6 +203,10 @@ def run_dynamic_sglang_mode(args, model_config: dict, router_config: dict):
             strategy_kwargs["js_threshold"] = router_config["js_threshold"]
             print(f"Using js threshold from config: {router_config['js_threshold']}")
 
+        if "js_topk" in router_config:
+            strategy_kwargs["js_topk"] = router_config["js_topk"]
+            print(f"Using js top-k from config: {router_config['js_topk']}")
+
     ref_model_path = model_config['reference']['model_path']
     qck_model_path = model_config['quick']['model_path']
 

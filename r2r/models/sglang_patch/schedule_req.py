@@ -24,9 +24,17 @@ class WaitingReq:
         sampling_params: Optional[SimpleSamplingParams] = None,
         status: str = "need",
         reference_logits=None,
+        reference_logits_mode: Optional[str] = None,
+        reference_topk_k: Optional[int] = None,
+        reference_topk_indices=None,
+        reference_topk_logits=None,
     ):
         self.rid = rid
         self.new_token_ids = new_token_ids
         self.sampling_params = sampling_params
         self.status = status
         self.reference_logits = reference_logits
+        self.reference_logits_mode = reference_logits_mode
+        self.reference_topk_k = reference_topk_k
+        self.reference_topk_indices = reference_topk_indices
+        self.reference_topk_logits = reference_topk_logits

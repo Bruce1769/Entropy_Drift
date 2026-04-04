@@ -29,6 +29,7 @@ from r2r.utils.switching import create_switching_strategy
 from r2r.utils.token_manager import SGLangTokenManager
 from r2r.utils.dataclass import ModelOutputs
 from r2r.utils.sampling import sample_token
+from r2r.utils.metrics import extract_topk_logits
 from r2r.models.sglang_patch.schedule_req import WaitingReq, SimpleSamplingParams
 from r2r.models.sglang_patch.llm_scheduler import LLMScheduler
 
@@ -277,6 +278,8 @@ class LLMServer:
     @staticmethod
     def process_result_from_slm(scheduler: Scheduler, commit_msgs):
         new_token_ids = {}
+        reference_logits_mode = {}
+        reference_topk_k = {}
         returned_rid_list = []
         finished_rid_list = set()
         if scheduler.batch_not_need is not None:
@@ -285,6 +288,8 @@ class LLMServer:
             req_already_prefilled = []
         for waiting_req in commit_msgs:
             new_token_ids[waiting_req.rid] = waiting_req.new_token_ids
+            reference_logits_mode[waiting_req.rid] = waiting_req.reference_logits_mode
+            reference_topk_k[waiting_req.rid] = waiting_req.reference_topk_k
             returned_rid_list.append(waiting_req.rid)
             if waiting_req.status == "finished":
                 finished_rid_list.add(waiting_req.rid)
@@ -309,6 +314,8 @@ class LLMServer:
                 )
                 if not hasattr(new_req, 'device'):
                     new_req.device = scheduler.batch_not_need.device
+                new_req.r2r_reference_logits_mode = reference_logits_mode.get(waiting_req.rid)
+                new_req.r2r_reference_topk_k = reference_topk_k.get(waiting_req.rid)
                 scheduler.waiting_queue.append(new_req)
 
         if scheduler.batch_not_need is not None:
@@ -332,6 +339,12 @@ class LLMServer:
                     new_req.req_pool_idx = req.req_pool_idx
                     if not hasattr(new_req, 'device'):
                         new_req.device = scheduler.batch_not_need.device
+                    new_req.r2r_reference_logits_mode = reference_logits_mode.get(
+                        req.rid, getattr(req, "r2r_reference_logits_mode", None)
+                    )
+                    new_req.r2r_reference_topk_k = reference_topk_k.get(
+                        req.rid, getattr(req, "r2r_reference_topk_k", None)
+                    )
                     scheduler.waiting_queue.append(new_req)
                 else:
                     not_keep_indices.append(i)
@@ -533,16 +546,33 @@ class LLMServer:
     def process_batch_results(rank: int, batch: ScheduleBatch, result, scheduler: Scheduler, outbound_queue: Optional[mp.Queue] = None):
         batch.output_ids = result.next_token_ids
         next_token_ids = result.next_token_ids.tolist()
-        reference_logits = result.logits_output.next_token_logits.cpu()
+        reference_logits = result.logits_output.next_token_logits
         req_to_send = []
 
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req.status = "notneed"
+            logits_mode = getattr(req, "r2r_reference_logits_mode", None)
+            topk_k = getattr(req, "r2r_reference_topk_k", None)
+            waiting_req_kwargs = {
+                "reference_logits_mode": logits_mode,
+                "reference_topk_k": topk_k,
+            }
+
+            if logits_mode == "full":
+                waiting_req_kwargs["reference_logits"] = reference_logits[i].detach().cpu()
+            elif logits_mode == "topk":
+                topk_logits, topk_indices = extract_topk_logits(
+                    reference_logits[i],
+                    topk_k or 64,
+                )
+                waiting_req_kwargs["reference_topk_logits"] = topk_logits.detach().cpu()
+                waiting_req_kwargs["reference_topk_indices"] = topk_indices.detach().cpu()
+
             waiting_req = WaitingReq(
                 rid=req.rid,
                 new_token_ids=[next_token_id],
                 sampling_params=None,
-                reference_logits=reference_logits[i],
+                **waiting_req_kwargs,
             )
             req_to_send.append(waiting_req)
         if rank == 0:

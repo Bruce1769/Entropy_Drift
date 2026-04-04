@@ -8,7 +8,13 @@ import sys
 import random
 from tqdm import tqdm
 
-from r2r.utils.metrics import compute_logu, compute_entropy, compute_js_divergence
+from r2r.utils.metrics import (
+    compute_logu,
+    compute_entropy,
+    compute_js_divergence,
+    compute_sparse_topk_js_divergence,
+    extract_topk_logits,
+)
 from r2r.models.router import load_model
 from r2r.utils.dataclass import ModelOutputs
 
@@ -23,7 +29,10 @@ class SwitchingState:
 
 class ModelSwitchingStrategy:
     """Base class for model switching strategies"""
+    requires_reference_evaluation = False
     requires_reference_logits = False
+    reference_distribution_mode = None
+    reference_topk_k = None
 
     def __init__(self, aleatoric_threshold: float = 2.275):
         self.aleatoric_threshold = aleatoric_threshold
@@ -47,6 +56,13 @@ class ModelSwitchingStrategy:
     def get_reference_candidates(self, outputs: ModelOutputs) -> torch.Tensor:
         """Return the subset that needs reference-model evaluation."""
         return self.route(outputs)
+
+    def get_reference_distribution_request(self) -> dict:
+        """Describe what distribution payload should be returned by the reference model."""
+        return {
+            "mode": self.reference_distribution_mode,
+            "topk_k": self.reference_topk_k,
+        }
 
 class ImmediateSwitching(ModelSwitchingStrategy):
     
@@ -153,7 +169,9 @@ class EntropySwitching(ModelSwitchingStrategy):
 class EntropyJSSwitching(ModelSwitchingStrategy):
     """Route high-entropy tokens to reference evaluation, then decide with JS divergence."""
 
+    requires_reference_evaluation = True
     requires_reference_logits = True
+    reference_distribution_mode = "full"
 
     def __init__(
         self,
@@ -203,6 +221,88 @@ class EntropyJSSwitching(ModelSwitchingStrategy):
         if candidate_mask.any():
             candidate_choices = self.route_with_reference_logits(
                 quick_logits[candidate_mask], reference_logits[candidate_mask]
+            ).to(device=quick_logits.device, dtype=torch.int)
+            model_choices[candidate_mask] = candidate_choices
+
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+class EntropyJSTopKSparseSwitching(EntropyJSSwitching):
+    """Route high-entropy tokens using sparse top-k reference distributions."""
+
+    requires_reference_logits = False
+    reference_distribution_mode = "topk"
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        entropy_threshold: Optional[float] = None,
+        js_threshold: Optional[float] = None,
+        js_topk: Optional[int] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model_path=model_path,
+            entropy_threshold=entropy_threshold,
+            js_threshold=js_threshold,
+            device=device,
+            dtype=dtype,
+            override_init_args=override_init_args,
+            **kwargs,
+        )
+        self.reference_topk_k = int(js_topk) if js_topk is not None else 64
+        print(
+            f"Using entropy_js_topk_sparse top-k: {self.reference_topk_k}"
+        )
+
+    def route_with_reference_topk(
+        self,
+        quick_topk_indices: torch.Tensor,
+        quick_topk_logits: torch.Tensor,
+        reference_topk_indices: torch.Tensor,
+        reference_topk_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        js_divergence = compute_sparse_topk_js_divergence(
+            logits_p=quick_topk_logits,
+            indices_p=quick_topk_indices,
+            logits_q=reference_topk_logits,
+            indices_q=reference_topk_indices,
+        )
+        return (js_divergence >= self.js_threshold).to(torch.int)
+
+    def extract_quick_topk(
+        self, quick_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        quick_topk_logits, quick_topk_indices = extract_topk_logits(
+            quick_logits, self.reference_topk_k
+        )
+        return quick_topk_indices, quick_topk_logits
+
+    def route(self, outputs: ModelOutputs) -> torch.Tensor:
+        if outputs.reference_topk_indices is None or outputs.reference_topk_logits is None:
+            raise ValueError(
+                "EntropyJSTopKSparseSwitching.route requires sparse reference top-k outputs"
+            )
+
+        batch_size = outputs.logits.shape[0]
+        quick_logits = outputs.logits[:, -1, :]
+        candidate_mask = self.get_reference_candidates(outputs).bool()
+        model_choices = torch.zeros(
+            batch_size, dtype=torch.int, device=quick_logits.device
+        )
+
+        if candidate_mask.any():
+            quick_topk_indices, quick_topk_logits = self.extract_quick_topk(
+                quick_logits[candidate_mask]
+            )
+            candidate_choices = self.route_with_reference_topk(
+                quick_topk_indices=quick_topk_indices,
+                quick_topk_logits=quick_topk_logits,
+                reference_topk_indices=outputs.reference_topk_indices[candidate_mask],
+                reference_topk_logits=outputs.reference_topk_logits[candidate_mask],
             ).to(device=quick_logits.device, dtype=torch.int)
             model_choices[candidate_mask] = candidate_choices
 
@@ -885,6 +985,7 @@ def create_switching_strategy(strategy_name: str, **kwargs) -> ModelSwitchingStr
         'immediate': ImmediateSwitching,
         'entropy': EntropySwitching,
         'entropy_js': EntropyJSSwitching,
+        'entropy_js_topk_sparse': EntropyJSTopKSparseSwitching,
         'momentum': MomentumSwitching,
         'rolling': SingleRollingWindowSwitching,
         'duo_rolling': DuoRollingWindowSwitching,

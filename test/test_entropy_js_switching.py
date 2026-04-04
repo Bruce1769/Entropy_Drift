@@ -1,13 +1,20 @@
 import torch
 
 from r2r.utils.dataclass import ModelOutputs
-from r2r.utils.metrics import compute_js_divergence
-from r2r.utils.switching import EntropyJSSwitching
+from r2r.utils.metrics import compute_js_divergence, compute_sparse_topk_js_divergence
+from r2r.utils.switching import EntropyJSSwitching, EntropyJSTopKSparseSwitching
 
 
 def test_compute_js_divergence_is_zero_for_identical_logits():
     logits = torch.tensor([1.0, 1.0, 1.0])
     js = compute_js_divergence(logits, logits)
+    assert abs(js) < 1e-8
+
+
+def test_compute_sparse_topk_js_divergence_is_zero_for_identical_sparse_logits():
+    logits = torch.tensor([2.0, 1.0])
+    indices = torch.tensor([0, 1])
+    js = compute_sparse_topk_js_divergence(logits, indices, logits, indices)
     assert abs(js) < 1e-8
 
 
@@ -49,6 +56,51 @@ def test_entropy_js_keeps_quick_when_js_is_low():
         hidden_states=[torch.zeros(1, 1, 4)],
         token=torch.tensor([[0]]),
         reference_logits=logits.clone(),
+    )
+
+    assert switching.get_reference_candidates(outputs).tolist() == [1]
+    assert switching.route(outputs).tolist() == [0]
+
+
+def test_entropy_js_topk_sparse_routes_high_entropy_high_js_tokens():
+    switching = EntropyJSTopKSparseSwitching(
+        entropy_threshold=0.45,
+        js_threshold=0.2,
+        js_topk=2,
+    )
+
+    quick_logits = torch.tensor(
+        [
+            [[1.0, 1.0, 1.0]],
+            [[10.0, -10.0, -10.0]],
+        ]
+    )
+    outputs = ModelOutputs(
+        logits=quick_logits,
+        hidden_states=[torch.zeros(2, 1, 4)],
+        token=torch.tensor([[0], [0]]),
+        reference_topk_indices=torch.tensor([[0, 1], [0, 1]]),
+        reference_topk_logits=torch.tensor([[10.0, -10.0], [10.0, -10.0]]),
+    )
+
+    assert switching.get_reference_candidates(outputs).tolist() == [1, 0]
+    assert switching.route(outputs).tolist() == [1, 0]
+
+
+def test_entropy_js_topk_sparse_keeps_quick_when_sparse_js_is_low():
+    switching = EntropyJSTopKSparseSwitching(
+        entropy_threshold=0.45,
+        js_threshold=0.2,
+        js_topk=2,
+    )
+
+    logits = torch.tensor([[[1.0, 1.0, 1.0]]])
+    outputs = ModelOutputs(
+        logits=logits,
+        hidden_states=[torch.zeros(1, 1, 4)],
+        token=torch.tensor([[0]]),
+        reference_topk_indices=torch.tensor([[0, 1]]),
+        reference_topk_logits=torch.tensor([[1.0, 1.0]]),
     )
 
     assert switching.get_reference_candidates(outputs).tolist() == [1]
