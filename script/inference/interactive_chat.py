@@ -199,6 +199,10 @@ def run_dynamic_sglang_mode(args, model_config: dict, router_config: dict):
             strategy_kwargs["entropy_threshold"] = router_config["entropy_threshold"]
             print(f"Using entropy threshold from config: {router_config['entropy_threshold']}")
 
+        if "js_threshold" in router_config:
+            strategy_kwargs["js_threshold"] = router_config["js_threshold"]
+            print(f"Using js threshold from config: {router_config['js_threshold']}")
+
     ref_model_path = model_config['reference']['model_path']
     qck_model_path = model_config['quick']['model_path']
 

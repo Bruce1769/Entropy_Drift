@@ -533,11 +533,17 @@ class LLMServer:
     def process_batch_results(rank: int, batch: ScheduleBatch, result, scheduler: Scheduler, outbound_queue: Optional[mp.Queue] = None):
         batch.output_ids = result.next_token_ids
         next_token_ids = result.next_token_ids.tolist()
+        reference_logits = result.logits_output.next_token_logits.cpu()
         req_to_send = []
 
-        for req, next_token_id in zip(batch.reqs, next_token_ids):
+        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req.status = "notneed"
-            waiting_req = WaitingReq(rid=req.rid,new_token_ids=[next_token_id],sampling_params=None)
+            waiting_req = WaitingReq(
+                rid=req.rid,
+                new_token_ids=[next_token_id],
+                sampling_params=None,
+                reference_logits=reference_logits[i],
+            )
             req_to_send.append(waiting_req)
         if rank == 0:
             try:

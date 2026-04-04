@@ -124,6 +124,10 @@ async def lifespan(app: FastAPI):
                 strategy_kwargs["entropy_threshold"] = router_config["entropy_threshold"]
                 print(f"Using entropy threshold from config: {router_config['entropy_threshold']}")
 
+            if "js_threshold" in router_config:
+                strategy_kwargs["js_threshold"] = router_config["js_threshold"]
+                print(f"Using js threshold from config: {router_config['js_threshold']}")
+
         try:
             system = SLDisaggregationSystem(
                 model_config=model_config,

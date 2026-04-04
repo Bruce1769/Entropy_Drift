@@ -8,7 +8,7 @@ import sys
 import random
 from tqdm import tqdm
 
-from r2r.utils.metrics import compute_logu, compute_entropy
+from r2r.utils.metrics import compute_logu, compute_entropy, compute_js_divergence
 from r2r.models.router import load_model
 from r2r.utils.dataclass import ModelOutputs
 
@@ -23,6 +23,8 @@ class SwitchingState:
 
 class ModelSwitchingStrategy:
     """Base class for model switching strategies"""
+    requires_reference_logits = False
+
     def __init__(self, aleatoric_threshold: float = 2.275):
         self.aleatoric_threshold = aleatoric_threshold
 
@@ -41,6 +43,10 @@ class ModelSwitchingStrategy:
             str: 'quick' or 'reference' indicating which model to use
         """
         raise NotImplementedError
+
+    def get_reference_candidates(self, outputs: ModelOutputs) -> torch.Tensor:
+        """Return the subset that needs reference-model evaluation."""
+        return self.route(outputs)
 
 class ImmediateSwitching(ModelSwitchingStrategy):
     
@@ -141,6 +147,65 @@ class EntropySwitching(ModelSwitchingStrategy):
             model_choices[i] = 0 if entropy < self.threshold else 1
         
         # Update state based on batch decisions
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+class EntropyJSSwitching(ModelSwitchingStrategy):
+    """Route high-entropy tokens to reference evaluation, then decide with JS divergence."""
+
+    requires_reference_logits = True
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        entropy_threshold: Optional[float] = None,
+        js_threshold: Optional[float] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.entropy_threshold = (
+            float(entropy_threshold) if entropy_threshold is not None else 0.45
+        )
+        self.js_threshold = float(js_threshold) if js_threshold is not None else 0.2
+        print(
+            f"Using entropy_js thresholds: entropy={self.entropy_threshold}, js={self.js_threshold}"
+        )
+
+    def get_reference_candidates(self, outputs: ModelOutputs) -> torch.Tensor:
+        next_token_logits = outputs.logits[:, -1, :]
+        entropy = compute_entropy(next_token_logits)
+        return (entropy >= self.entropy_threshold).to(torch.int)
+
+    def route_with_reference_logits(
+        self, quick_logits: torch.Tensor, reference_logits: torch.Tensor
+    ) -> torch.Tensor:
+        js_divergence = compute_js_divergence(quick_logits, reference_logits)
+        return (js_divergence >= self.js_threshold).to(torch.int)
+
+    def route(self, outputs: ModelOutputs) -> torch.Tensor:
+        if outputs.reference_logits is None:
+            raise ValueError(
+                "EntropyJSSwitching.route requires outputs.reference_logits for final routing"
+            )
+
+        batch_size = outputs.logits.shape[0]
+        quick_logits = outputs.logits[:, -1, :]
+        reference_logits = outputs.reference_logits[:, -1, :]
+
+        candidate_mask = self.get_reference_candidates(outputs).bool()
+        model_choices = torch.zeros(
+            batch_size, dtype=torch.int, device=quick_logits.device
+        )
+
+        if candidate_mask.any():
+            candidate_choices = self.route_with_reference_logits(
+                quick_logits[candidate_mask], reference_logits[candidate_mask]
+            ).to(device=quick_logits.device, dtype=torch.int)
+            model_choices[candidate_mask] = candidate_choices
+
         self.state.last_model = "reference" if model_choices.any().item() else "quick"
         return model_choices
 
@@ -819,6 +884,7 @@ def create_switching_strategy(strategy_name: str, **kwargs) -> ModelSwitchingStr
     strategies = {
         'immediate': ImmediateSwitching,
         'entropy': EntropySwitching,
+        'entropy_js': EntropyJSSwitching,
         'momentum': MomentumSwitching,
         'rolling': SingleRollingWindowSwitching,
         'duo_rolling': DuoRollingWindowSwitching,

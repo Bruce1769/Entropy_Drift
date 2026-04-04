@@ -1,0 +1,24 @@
+{
+  "quick": {
+    "model_name": "DeepSeek-R1-Distill-Qwen-1.5B",
+    "model_path": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "mem_fraction_static": 0.82,
+    "max_new_tokens": 16,
+    "base_gpu_id": 0,
+    "tp_size": 1
+  },
+  "reference": {
+    "model_name": "Qwen2.5-72B-Instruct",
+    "model_path": "Qwen/Qwen2.5-72B-Instruct",
+    "mem_fraction_static": 0.90,
+    "max_new_tokens": 16,
+    "base_gpu_id": 4,
+    "tp_size": 4
+  },
+  "router": {
+    "router_name": "DeepSeek-R1-Distill-Qwen-1.5B+DeepSeek-R1-Distill-Qwen-1.5B-32B",
+    "switching_strategy": "entropy_js",
+    "entropy_threshold": 0.45,
+    "js_threshold": 0.2
+  }
+}

@@ -23,9 +23,10 @@ class WaitingReq:
         new_token_ids: List[int],
         sampling_params: Optional[SimpleSamplingParams] = None,
         status: str = "need",
+        reference_logits=None,
     ):
         self.rid = rid
         self.new_token_ids = new_token_ids
         self.sampling_params = sampling_params
         self.status = status
-
+        self.reference_logits = reference_logits

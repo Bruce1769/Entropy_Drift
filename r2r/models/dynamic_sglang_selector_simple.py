@@ -187,10 +187,15 @@ class DynamicSimpleSGLangSelector:
             )
             DynamicSimpleSGLangSelector.simple_prepare_for_extend(new_batch)
             batch = new_batch.get_model_worker_batch()
-            logits_output, next_token_ids = scheduler.tp_worker.forward_batch_generation(batch)
+            result = scheduler.tp_worker.forward_batch_generation(batch)
+            logits_output = result[0] if isinstance(result, tuple) else None
+            next_token_ids = result[1] if isinstance(result, tuple) else result
             next_token_ids_list = next_token_ids.tolist()
 
-            output_queue.put(next_token_ids_list)
+            output_queue.put({
+                "next_token_ids": next_token_ids_list,
+                "logits": logits_output.next_token_logits.cpu() if logits_output is not None else None,
+            })
 
     def init_model_switching_strategy(self):
         """Initialize or reinitialize the model switching strategy with stored parameters"""
@@ -289,7 +294,13 @@ class DynamicSimpleSGLangSelector:
             batch.model_config.vocab_size,
         )
 
-    def extend_step(self, input_ids: List[List[int]], input_indices: List[int], sampling_params: SamplingParams) -> List[int]:
+    def extend_step(
+        self,
+        input_ids: List[List[int]],
+        input_indices: List[int],
+        sampling_params: SamplingParams,
+        return_logits: bool = False,
+    ) -> Union[List[int], dict]:
         """
         Extend the input ids using the reference model
         """
@@ -312,7 +323,8 @@ class DynamicSimpleSGLangSelector:
             reqs.append(req)
 
         self.reference_model_input_queue.put_nowait(reqs)
-        next_token_ids = self.reference_model_output_queue.get()
+        payload = self.reference_model_output_queue.get()
+        next_token_ids = payload["next_token_ids"] if isinstance(payload, dict) else payload
 
         # Update prefix indices for each prompt
         for i in range(subset_batch_size):
@@ -322,6 +334,11 @@ class DynamicSimpleSGLangSelector:
             # else:
             #     self.reference_prefix_indices_list[input_indices[i]].append(self.reference_prefix_indices_list[input_indices[i]][-1] + 1)
 
+        if return_logits:
+            return {
+                "next_token_ids": next_token_ids,
+                "logits": payload["logits"][:, None, :] if isinstance(payload, dict) and payload.get("logits") is not None else None,
+            }
         return next_token_ids
 
     def decode_step(self, scheduler: Scheduler):
@@ -475,15 +492,22 @@ class DynamicSimpleSGLangSelector:
                 token=next_token_ids[:, None],
             )
 
-            # Use switching strategy to decide which model to use for each input
-            model_choices = self.switching_strategy.route(model_outputs)
+            if getattr(self.switching_strategy, "requires_reference_logits", False):
+                reference_candidates = self.switching_strategy.get_reference_candidates(
+                    model_outputs
+                )
+                model_choices = torch.zeros_like(reference_candidates)
+            else:
+                # Use switching strategy to decide which model to use for each input
+                model_choices = self.switching_strategy.route(model_outputs)
+                reference_candidates = model_choices
 
             # Check if reference model is needed for any prompt
-            reference_needed = torch.any(model_choices).item()
+            reference_needed = torch.any(reference_candidates).item()
 
             if reference_needed:
                 # Get indices of inputs that need reference model as a list
-                reference_indices = torch.where(model_choices == 1)[0].tolist()
+                reference_indices = torch.where(reference_candidates == 1)[0].tolist()
                 reference_input_ids = token_manager.fetch_active_input_ids(reference_indices)
 
                 # Generate with reference model for inputs that need it
@@ -491,9 +515,28 @@ class DynamicSimpleSGLangSelector:
                     input_ids=reference_input_ids,
                     input_indices=reference_indices,
                     sampling_params=reference_sampling_params,
+                    return_logits=getattr(
+                        self.switching_strategy, "requires_reference_logits", False
+                    ),
                 )
-                for i, reference_output_token in enumerate(reference_outputs):
-                    next_token_ids[reference_indices[i]] = reference_output_token
+
+                if getattr(self.switching_strategy, "requires_reference_logits", False):
+                    reference_tokens = reference_outputs["next_token_ids"]
+                    if reference_outputs["logits"] is not None:
+                        full_reference_logits = torch.zeros_like(logits)
+                        full_reference_logits[reference_indices] = reference_outputs[
+                            "logits"
+                        ].to(device=logits.device, dtype=logits.dtype)
+                        model_outputs.reference_logits = full_reference_logits
+                        model_choices = self.switching_strategy.route(model_outputs)
+                    else:
+                        model_choices[reference_indices] = 1
+                else:
+                    reference_tokens = reference_outputs
+
+                for i, reference_output_token in enumerate(reference_tokens):
+                    if model_choices[reference_indices[i]].item() == 1:
+                        next_token_ids[reference_indices[i]] = reference_output_token
 
                 # Combine outputs based on model choices
                 # Record if needed

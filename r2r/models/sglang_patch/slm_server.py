@@ -312,7 +312,14 @@ class SLMServer:
                     if llm_reqs:
                         nvtx.push_range("SLM")
                         init_nvtx = True
-                        SLMServer.process_result_from_llm(rank, scheduler, llm_reqs, finished_queue, outbound_queue)
+                        SLMServer.process_result_from_llm(
+                            rank,
+                            scheduler,
+                            llm_reqs,
+                            router,
+                            finished_queue,
+                            outbound_queue,
+                        )
                 
                 recv_reqs = SLMServer.recv_requests(scheduler)
                 ok = SLMServer.process_new_requests(recv_reqs, scheduler, rank, outbound_queue)
@@ -432,13 +439,20 @@ class SLMServer:
         return recv_reqs
 
     @staticmethod
-    def process_result_from_llm(rank: int, scheduler: Scheduler, commit_msgs, finished_queue: Optional[mp.Queue] = None, outbound_queue: Optional[mp.Queue] = None):
-        if rank == 0 and hasattr(scheduler, "n_llm_generated_tokens"):
-            scheduler.n_llm_generated_tokens += len(commit_msgs)
+    def process_result_from_llm(
+        rank: int,
+        scheduler: Scheduler,
+        commit_msgs,
+        router,
+        finished_queue: Optional[mp.Queue] = None,
+        outbound_queue: Optional[mp.Queue] = None,
+    ):
         better_token_ids = {}
+        reference_logits = {}
         returned_rid_list = []
         for waiting_req in commit_msgs:
             better_token_ids[waiting_req.rid] = waiting_req.new_token_ids[-1]
+            reference_logits[waiting_req.rid] = waiting_req.reference_logits
             returned_rid_list.append(waiting_req.rid)
         keep_indices = []
         not_keep_indices = []
@@ -451,11 +465,45 @@ class SLMServer:
             output_ids_list = []
             for i, req in enumerate(scheduler.last_batch.reqs):
                 if req.rid in returned_rid_list:
-                    if better_token_ids[req.rid] in scheduler.model_config.hf_eos_token_id:
+                    final_token_id = int(better_token_ids[req.rid])
+                    source_model = "reference"
+
+                    if getattr(router, "requires_reference_logits", False):
+                        quick_logits = getattr(req, "r2r_quick_logits", None)
+                        quick_token_id = getattr(req, "r2r_quick_token_id", None)
+                        ref_logits = reference_logits.get(req.rid)
+
+                        if (
+                            quick_logits is not None
+                            and quick_token_id is not None
+                            and ref_logits is not None
+                        ):
+                            use_reference = (
+                                router.route_with_reference_logits(
+                                    quick_logits[None, :], ref_logits[None, :]
+                                )[0].item()
+                                == 1
+                            )
+                            if not use_reference:
+                                final_token_id = int(quick_token_id)
+                                source_model = "quick"
+
+                        if hasattr(req, "r2r_quick_logits"):
+                            delattr(req, "r2r_quick_logits")
+                        if hasattr(req, "r2r_quick_token_id"):
+                            delattr(req, "r2r_quick_token_id")
+
+                    if final_token_id in scheduler.model_config.hf_eos_token_id:
                         scheduler.abort_request(AbortReq(req.rid))
-                    req.output_ids.append(better_token_ids[req.rid])
-                    # Track LLM token generation
-                    req.llm_token_count = getattr(req, 'llm_token_count', 0) + 1
+                    req.output_ids.append(final_token_id)
+                    if source_model == "reference":
+                        req.llm_token_count = getattr(req, 'llm_token_count', 0) + 1
+                        if rank == 0 and hasattr(scheduler, "n_llm_generated_tokens"):
+                            scheduler.n_llm_generated_tokens += 1
+                    else:
+                        req.slm_token_count = getattr(req, 'slm_token_count', 0) + 1
+                        if rank == 0 and hasattr(scheduler, "n_slm_generated_tokens"):
+                            scheduler.n_slm_generated_tokens += 1
                     req.status = "need"
                     req.check_finished()
                     if req.finished():
@@ -635,7 +683,10 @@ class SLMServer:
             token=next_token_ids[:, None],
         )
         # Use switching strategy to decide which model to use for each input
-        model_choices = router.route(model_outputs).cpu()
+        if getattr(router, "requires_reference_logits", False):
+            model_choices = router.get_reference_candidates(model_outputs).cpu()
+        else:
+            model_choices = router.route(model_outputs).cpu()
         # TODO: merge router into sglang
 
         # Check if reference model is needed for any prompt
@@ -646,6 +697,9 @@ class SLMServer:
                 if model_choices[i] == 1:
                     # TODO: send origin input to LLM to prefill prefix only
                     req.status = "notneed"
+                    if getattr(router, "requires_reference_logits", False):
+                        req.r2r_quick_logits = logits[i, 0].detach().cpu()
+                        req.r2r_quick_token_id = int(next_token_ids[i].item())
                     new_token_ids = []
                     if req.last_llm_loc is None:
                         req.last_llm_loc = 0
