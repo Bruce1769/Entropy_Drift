@@ -7,7 +7,7 @@
     "model_name": "Qwen3-0.6B",
     "model_path": "Qwen/Qwen3-0.6B",
     "param": "0.6",
-    "mem_fraction_static": 0.15
+    "mem_fraction_static": 0.30
   },
   "reference": {
     "model_name": "Qwen3-8B",

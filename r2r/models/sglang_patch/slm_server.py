@@ -557,8 +557,10 @@ class SLMServer:
                     req.status = "need"
                     req.check_finished()
                     if req.finished():
+                        req.status = "finished"
                         SLMServer.cache_finished_req_compat(rank, scheduler, req)
                         finished_reqs.append(req)
+                        scheduler.n_active_reqs -= 1
                     keep_indices.append(i)
                 elif req.status == "need":
                     keep_indices.append(i)
@@ -569,6 +571,14 @@ class SLMServer:
             )
             
             scheduler.last_batch.filter_batch(keep_indices=keep_indices)
+            # Requests returned from the LLM are reinserted into last_batch here.
+            # If this batch still carries the old "merged" marker from a previous
+            # scheduler cycle, get_next_batch_to_run() will skip merging it back
+            # into running_batch, leaving the request stranded in a CPU-side busy
+            # loop with no further GPU work. Clear the marker so the scheduler
+            # can re-attach the batch on the next iteration.
+            if returned_rid_list and hasattr(scheduler.last_batch, "merged"):
+                delattr(scheduler.last_batch, "merged")
             
             for i, req in enumerate(scheduler.batch_not_need.reqs):
                 if req.status == "notneed" and req.rid not in returned_rid_list:
@@ -888,7 +898,8 @@ class SLMServer:
             req.slm_token_count = getattr(req, 'slm_token_count', 0) + 1
             req.check_finished()
             if req.finished():
-                scheduler.tree_cache.cache_finished_req(req)
+                req.status = "finished"
+                SLMServer.cache_finished_req_compat(rank, scheduler, req)
                 finished_reqs.append(req)
                 scheduler.n_active_reqs -= 1
 

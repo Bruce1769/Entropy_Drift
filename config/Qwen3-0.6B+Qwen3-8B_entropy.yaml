@@ -41,8 +41,10 @@
   },
   "router": {
     "router_name": "Qwen3-0.6B+Qwen3-8B",
-    "switching_strategy": "entropy_js",
-    "entropy_threshold": 0.45,
-    "js_threshold": 0.2
+    "router_path": "GY2233/Qwen3_0_6B_Qwen3_8B",
+    "switching_strategy": "entropy",
+    "override_init_args": {
+      "pretrained_model_name": "Qwen/Qwen3-0.6B"
+    }
   }
 }

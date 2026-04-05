@@ -79,6 +79,16 @@
         "prompt_template": "{question}",
         "description": "American Invitational Mathematics Examination problems with numerical answers"
     },
+    "aime26": {
+        "name": "AIME 2026 Mathematical Problems",
+        "path": "MathArena/aime_2026",
+        "answer_type": "boxed",
+        "id_field": "problem_idx",
+        "question_field": "problem",
+        "answer_field": "answer",
+        "prompt_template": "{question}",
+        "description": "American Invitational Mathematics Examination 2026 problems with numerical answers"
+    },
     "livecodebench": {
         "name": "LiveCodeBench",
         "path": "livecodebench/code_generation_lite",

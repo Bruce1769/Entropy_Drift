@@ -416,9 +416,12 @@ class SLDisaggregationSystem:
         input_text = ["Hi"]
         input_ids = [self.tokenizer.encode(text) for text in input_text]
         quick_sampling_params = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_new_tokens=warmup_iter, stop=[])
+        warmup_rids = []
         for i, (text, input_id) in enumerate(zip(input_text, input_ids)):
+            rid = str(i)
+            warmup_rids.append(rid)
             req = Req(
-                rid=str(i),
+                rid=rid,
                 origin_input_text=text,
                 origin_input_ids=input_id,
                 sampling_params=quick_sampling_params,
@@ -431,8 +434,21 @@ class SLDisaggregationSystem:
             except zmq.Again:
                 time.sleep(0.01)
                 self.req_sender.send_pyobj(req)
-        
-        time.sleep(5)
+
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if all(rid in self.finished_reqs for rid in warmup_rids):
+                break
+            time.sleep(0.1)
+        else:
+            print("[SLDisaggregationSystem] Warning: quick-model warmup did not finish within 120s")
+
+        for rid in warmup_rids:
+            self.finished_reqs.pop(rid, None)
+            try:
+                self.finished_reqs_rids.remove(rid)
+            except ValueError:
+                pass
     
     def get_rid(self):
         with self.rid_lock:

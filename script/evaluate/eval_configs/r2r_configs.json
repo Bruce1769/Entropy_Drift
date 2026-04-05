@@ -7,6 +7,10 @@
         "router_path": "resource/default_router.pt",
         "threshold": 0.40595959595959596
     },
+    "aime26":{
+        "router_path": "resource/default_router.pt",
+        "threshold": 0.40595959595959596
+    },
     "gpqa":{
         "router_path": "resource/default_router.pt",
         "threshold": 0.42

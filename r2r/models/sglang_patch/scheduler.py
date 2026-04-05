@@ -638,6 +638,8 @@ class PrefillAdderSLM(PrefillAdder):
     @property
     def rem_total_tokens(self):
         rem_total_tokens_slm = super().rem_total_tokens
+        if self.llm_kvcache_size is None:
+            return rem_total_tokens_slm
         rem_total_tokens_llm = self.llm_kvcache_size.value
         for req in self.issued_reqs:
             rem_total_tokens_llm -= len(req.origin_input_ids) + req.sampling_params.max_new_tokens
