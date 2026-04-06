@@ -636,7 +636,7 @@ class LLMServer:
                     reference_logits[i],
                     topk_k or 64,
                 )
-                if decision_mode == "llm_sparse_js":
+                if decision_mode in {"llm_sparse_js", "async_llm_sparse_js"}:
                     quick_token_id = getattr(req, "r2r_quick_token_id", None)
                     quick_topk_indices = getattr(req, "r2r_quick_topk_indices", None)
                     quick_topk_logits = getattr(req, "r2r_quick_topk_logits", None)
@@ -661,6 +661,9 @@ class LLMServer:
                             final_token_id = int(quick_token_id)
                             final_token_source = "quick"
                     waiting_req_kwargs["final_token_source"] = final_token_source
+                    waiting_req_kwargs["async_speculative"] = (
+                        decision_mode == "async_llm_sparse_js"
+                    )
                 else:
                     waiting_req_kwargs["reference_topk_logits"] = topk_logits.detach().cpu()
                     waiting_req_kwargs["reference_topk_indices"] = topk_indices.detach().cpu()

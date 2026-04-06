@@ -35,6 +35,7 @@ class WaitingReq:
         quick_topk_indices=None,
         quick_topk_logits=None,
         final_token_source: Optional[str] = None,
+        async_speculative: bool = False,
     ):
         self.rid = rid
         self.new_token_ids = new_token_ids
@@ -52,3 +53,4 @@ class WaitingReq:
         self.quick_topk_indices = quick_topk_indices
         self.quick_topk_logits = quick_topk_logits
         self.final_token_source = final_token_source
+        self.async_speculative = async_speculative

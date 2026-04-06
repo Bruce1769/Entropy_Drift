@@ -480,13 +480,17 @@ class SLMServer:
                     llm_result = llm_results[req.rid]
                     final_token_id = int(llm_result.new_token_ids[-1])
                     source_model = getattr(llm_result, "final_token_source", None) or "reference"
+                    async_speculative = bool(
+                        getattr(req, "r2r_async_speculative_pending", False)
+                        or getattr(llm_result, "async_speculative", False)
+                    )
 
                     if getattr(router, "requires_reference_evaluation", False):
                         quick_token_id = getattr(req, "r2r_quick_token_id", None)
                         distribution_mode = getattr(req, "r2r_reference_logits_mode", None)
                         decision_mode = getattr(req, "r2r_reference_decision_mode", None)
 
-                        if decision_mode in {"llm_sparse_js", "llm_full_js"}:
+                        if decision_mode in {"llm_sparse_js", "llm_full_js", "async_llm_sparse_js"}:
                             pass
                         elif distribution_mode == "full":
                             quick_logits = getattr(req, "r2r_quick_logits", None)
@@ -543,17 +547,50 @@ class SLMServer:
                             if hasattr(req, attr_name):
                                 delattr(req, attr_name)
 
+                    if async_speculative:
+                        provisional_token_id = getattr(
+                            req, "r2r_async_provisional_token_id", None
+                        )
+                        if provisional_token_id is None and req.output_ids:
+                            provisional_token_id = int(req.output_ids[-1])
+
+                        if req.output_ids:
+                            req.output_ids[-1] = final_token_id
+                        else:
+                            req.output_ids.append(final_token_id)
+
+                        if source_model == "reference":
+                            req.llm_token_count = getattr(req, "llm_token_count", 0) + 1
+                            req.slm_token_count = max(
+                                0, getattr(req, "slm_token_count", 0) - 1
+                            )
+                            if rank == 0 and hasattr(scheduler, "n_llm_generated_tokens"):
+                                scheduler.n_llm_generated_tokens += 1
+                            if final_token_id != provisional_token_id:
+                                # Rebuild prefix cache on the next step if speculative
+                                # quick and verified reference tokens disagree.
+                                req.reset_for_retract()
+                        else:
+                            source_model = "quick"
+                    else:
+                        req.output_ids.append(final_token_id)
+                        if source_model == "reference":
+                            req.llm_token_count = getattr(req, 'llm_token_count', 0) + 1
+                            if rank == 0 and hasattr(scheduler, "n_llm_generated_tokens"):
+                                scheduler.n_llm_generated_tokens += 1
+                        else:
+                            req.slm_token_count = getattr(req, 'slm_token_count', 0) + 1
+                            if rank == 0 and hasattr(scheduler, "n_slm_generated_tokens"):
+                                scheduler.n_slm_generated_tokens += 1
+
                     if final_token_id in scheduler.model_config.hf_eos_token_id:
                         scheduler.abort_request(AbortReq(req.rid))
-                    req.output_ids.append(final_token_id)
-                    if source_model == "reference":
-                        req.llm_token_count = getattr(req, 'llm_token_count', 0) + 1
-                        if rank == 0 and hasattr(scheduler, "n_llm_generated_tokens"):
-                            scheduler.n_llm_generated_tokens += 1
-                    else:
-                        req.slm_token_count = getattr(req, 'slm_token_count', 0) + 1
-                        if rank == 0 and hasattr(scheduler, "n_slm_generated_tokens"):
-                            scheduler.n_slm_generated_tokens += 1
+                    for attr_name in (
+                        "r2r_async_speculative_pending",
+                        "r2r_async_provisional_token_id",
+                    ):
+                        if hasattr(req, attr_name):
+                            delattr(req, attr_name)
                     req.status = "need"
                     req.check_finished()
                     if req.finished():
@@ -802,7 +839,7 @@ class SLMServer:
                                 logits[i, 0].detach(),
                                 reference_request.get("topk_k") or 64,
                             )
-                            if reference_request.get("decision_mode") == "llm_sparse_js":
+                            if reference_request.get("decision_mode") in {"llm_sparse_js", "async_llm_sparse_js"}:
                                 quick_topk_indices_cpu = quick_topk_indices.cpu()
                                 quick_topk_logits_cpu = quick_topk_logits.cpu()
                             else:
@@ -838,11 +875,17 @@ class SLMServer:
                     if (
                         getattr(router, "requires_reference_evaluation", False)
                         and reference_request.get("mode") == "topk"
-                        and reference_request.get("decision_mode") == "llm_sparse_js"
+                        and reference_request.get("decision_mode") in {"llm_sparse_js", "async_llm_sparse_js"}
                     ):
                         waiting_req.quick_token_id = int(next_token_ids[i].item())
                         waiting_req.quick_topk_indices = quick_topk_indices_cpu
                         waiting_req.quick_topk_logits = quick_topk_logits_cpu
+                        waiting_req.async_speculative = (
+                            reference_request.get("decision_mode") == "async_llm_sparse_js"
+                        )
+                    if reference_request.get("decision_mode") == "async_llm_sparse_js":
+                        req.r2r_async_speculative_pending = True
+                        req.r2r_async_provisional_token_id = int(next_token_ids[i].item())
                     req_to_send.append(waiting_req)
         return result, req_to_send
 
@@ -878,7 +921,14 @@ class SLMServer:
                 scheduler.n_slm_generated_tokens = 0
             if not hasattr(scheduler, "n_llm_generated_tokens"):
                 scheduler.n_llm_generated_tokens = 0
-            scheduler.n_slm_generated_tokens += batch.batch_size() - len(req_to_send)
+            async_speculative_count = sum(
+                1
+                for req in batch.reqs
+                if getattr(req, "r2r_async_speculative_pending", False)
+            )
+            scheduler.n_slm_generated_tokens += (
+                batch.batch_size() - len(req_to_send) + async_speculative_count
+            )
             gap_latency = time.perf_counter() - scheduler.last_status_time
             if gap_latency > 10:
                 print(f"[quick rank{rank}] throughput: {(scheduler.n_slm_generated_tokens + scheduler.n_llm_generated_tokens) / gap_latency:.2f} tokens/s, llm_ratio: {scheduler.n_llm_generated_tokens / (scheduler.n_slm_generated_tokens + scheduler.n_llm_generated_tokens + 1e-8):.2%}")
@@ -890,6 +940,10 @@ class SLMServer:
 
         for req, next_token_id in zip(batch.reqs, result.next_token_ids):
             if req.status == "notneed":
+                if getattr(req, "r2r_async_speculative_pending", False):
+                    req.output_ids.append(next_token_id.item())
+                    req.slm_token_count = getattr(req, "slm_token_count", 0) + 1
+                    req.r2r_async_provisional_token_id = int(next_token_id.item())
                 continue
             if next_token_id in scheduler.model_config.hf_eos_token_id:
                 scheduler.abort_request(AbortReq(req.rid))

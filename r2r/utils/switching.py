@@ -34,6 +34,7 @@ class ModelSwitchingStrategy:
     reference_distribution_mode = None
     reference_topk_k = None
     reference_decision_mode = None
+    async_speculative_validation = False
 
     def __init__(self, aleatoric_threshold: float = 2.275):
         self.aleatoric_threshold = aleatoric_threshold
@@ -370,6 +371,38 @@ class EntropyJSTopKLLMSwitching(EntropyJSTopKSparseSwitching):
             **kwargs,
         )
         print("Using entropy_js_topk_llm with LLM-side sparse JS final decision")
+
+
+class EntropyJSTopKAsyncSwitching(EntropyJSTopKSparseSwitching):
+    """Route high-entropy tokens to async speculative sparse top-k JS validation."""
+
+    reference_decision_mode = "async_llm_sparse_js"
+    async_speculative_validation = True
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        entropy_threshold: Optional[float] = None,
+        js_threshold: Optional[float] = None,
+        js_topk: Optional[int] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model_path=model_path,
+            entropy_threshold=entropy_threshold,
+            js_threshold=js_threshold,
+            js_topk=js_topk,
+            device=device,
+            dtype=dtype,
+            override_init_args=override_init_args,
+            **kwargs,
+        )
+        print(
+            "Using entropy_js_topk_async with async speculative sparse JS validation"
+        )
 
 class MomentumSwitching(ModelSwitchingStrategy):
     """Momentum-based switching with asymmetric behavior"""
@@ -1050,6 +1083,7 @@ def create_switching_strategy(strategy_name: str, **kwargs) -> ModelSwitchingStr
         'entropy_js_llm': EntropyJSLLMSwitching,
         'entropy_js_topk_sparse': EntropyJSTopKSparseSwitching,
         'entropy_js_topk_llm': EntropyJSTopKLLMSwitching,
+        'entropy_js_topk_async': EntropyJSTopKAsyncSwitching,
         'momentum': MomentumSwitching,
         'rolling': SingleRollingWindowSwitching,
         'duo_rolling': DuoRollingWindowSwitching,

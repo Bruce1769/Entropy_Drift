@@ -5,6 +5,7 @@ from r2r.utils.metrics import compute_js_divergence, compute_sparse_topk_js_dive
 from r2r.utils.switching import (
     EntropyJSSwitching,
     EntropyJSLLMSwitching,
+    EntropyJSTopKAsyncSwitching,
     EntropyJSTopKSparseSwitching,
     EntropyJSTopKLLMSwitching,
 )
@@ -174,3 +175,19 @@ def test_entropy_js_topk_llm_matches_sparse_route_locally():
 
     assert switching.get_reference_candidates(outputs).tolist() == [1]
     assert switching.route(outputs).tolist() == [0]
+
+
+def test_entropy_js_topk_async_reports_async_llm_side_decision_request():
+    switching = EntropyJSTopKAsyncSwitching(
+        entropy_threshold=0.45,
+        js_threshold=0.2,
+        js_topk=64,
+    )
+
+    assert switching.async_speculative_validation is True
+    assert switching.get_reference_distribution_request() == {
+        "mode": "topk",
+        "topk_k": 64,
+        "decision_mode": "async_llm_sparse_js",
+        "js_threshold": 0.2,
+    }
