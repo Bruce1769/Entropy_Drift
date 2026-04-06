@@ -41,10 +41,8 @@
   },
   "router": {
     "router_name": "Qwen3-0.6B+Qwen3-32B",
-    "router_path": "nics-efc/R2R_router_collections/Qwen3-0.6B+Qwen3-32B/default_router.pt",
-    "threshold": 0.3564646464646465,
-    "override_init_args":{
-      "pretrained_model_name": "Qwen/Qwen3-0.6B"
-    }
+    "switching_strategy": "entropy_js",
+    "entropy_threshold": 0.45,
+    "js_threshold": 0.2
   }
 }

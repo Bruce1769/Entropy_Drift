@@ -13,7 +13,7 @@
     "model_name": "Qwen3-8B",
     "model_path": "Qwen/Qwen3-8B",
     "param": "8",
-    "mem_fraction_static": 0.80
+    "mem_fraction_static": 0.90
   },
   "continuation_main": {
     "model_name": "Qwen3-8B",

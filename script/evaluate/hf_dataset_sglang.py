@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import time
 import math
@@ -126,6 +127,8 @@ def parse_args():
     # Recovery configuration
     parser.add_argument('--problem_ids', type=str, default=None,
                       help='Comma-separated list of specific problem IDs to process')
+    parser.add_argument('--skip_problem_ids', type=str, default=None,
+                      help='Comma-separated list of specific problem IDs to skip')
     parser.add_argument('--resume', action='store_true',
                       help='Resume from last checkpoint, processing only failed or missing problems')
     
@@ -843,6 +846,60 @@ def combine_results(output_dir: str) -> Dict:
     
     return stats
 
+def run_livecodebench_postprocess(output_dir: str) -> Optional[str]:
+    """Generate the evaluated LiveCodeBench metrics CSV from combined results."""
+    combined_results_path = os.path.join(output_dir, "combined_results.csv")
+    if not os.path.exists(combined_results_path):
+        print(f"combined_results.csv not found in {output_dir}")
+        return None
+
+    repo_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+    extractor_script = os.path.join(
+        repo_root, "r2r", "evaluate", "extract_livecodebench_answer.py"
+    )
+    evaluation_output_path = os.path.join(
+        output_dir, "combined_results_evaluation_light.csv"
+    )
+
+    if not os.path.exists(extractor_script):
+        print(f"LiveCodeBench extractor not found at {extractor_script}")
+        return None
+
+    try:
+        subprocess.run(
+            [sys.executable, extractor_script, "--csv_path", combined_results_path],
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"LiveCodeBench post-process failed: {exc}")
+        return None
+
+    if os.path.exists(evaluation_output_path):
+        print(f"livecodebench results saved in {evaluation_output_path}")
+        return evaluation_output_path
+
+    print(f"Expected LiveCodeBench output not found at {evaluation_output_path}")
+    return None
+
+def get_metrics_results_path(args: argparse.Namespace, output_dir: str) -> Optional[str]:
+    """Select the best available metrics file for the current dataset."""
+    combined_results_path = os.path.join(output_dir, "combined_results.csv")
+
+    if args.dataset_config_dict.get("answer_type") == "livecodebench":
+        evaluation_output_path = os.path.join(
+            output_dir, "combined_results_evaluation_light.csv"
+        )
+        if os.path.exists(evaluation_output_path):
+            return evaluation_output_path
+        return run_livecodebench_postprocess(output_dir)
+
+    if os.path.exists(combined_results_path):
+        return combined_results_path
+
+    return None
+
 def get_completed_problems(output_dir: str) -> set:
     """Get set of problem IDs that have been successfully processed by reading temp txt files."""
     completed = set()
@@ -1064,10 +1121,10 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
     print(f"Total problems in dataset: {len(all_problems)}")
     
     # Load and analyze combined results if available
-    combined_results_path = os.path.join(output_dir, "combined_results.csv")
-    if os.path.exists(combined_results_path):
+    metrics_results_path = get_metrics_results_path(args, output_dir)
+    if metrics_results_path is not None and os.path.exists(metrics_results_path):
         try:
-            df = pd.read_csv(combined_results_path)
+            df = pd.read_csv(metrics_results_path)
             print(f"\nResults analyzed from: {len(df)} completed problems")
             
             # Basic accuracy metrics
@@ -1079,7 +1136,10 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
             
             if 'is_correct' in df.columns:
                 overall_accuracy = df['is_correct'].mean() * 100
-                print(f"Overall accuracy: {overall_accuracy:.2f}%")
+                if args.dataset_config_dict.get("answer_type") == "livecodebench":
+                    print(f"Pass@1: {overall_accuracy:.2f}%")
+                else:
+                    print(f"Overall accuracy: {overall_accuracy:.2f}%")
             
             # Pass@1 metrics (if repeat_input_num > 1)
             if args.repeat_input_num > 1 and 'is_correct' in df.columns:
@@ -1166,7 +1226,7 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
         except Exception as e:
             print(f"\nWarning: Could not analyze combined results: {e}")
     else:
-        print(f"\nNote: Combined results file not found at {combined_results_path}")
+        print(f"\nNote: Metrics results file not found in {output_dir}")
     
     print("\n" + "="*80)
     print("END OF EVALUATION METRICS")
@@ -1211,13 +1271,22 @@ def main():
     completed_problems = get_completed_problems(args.output_dir) if args.resume else set()
     
     if args.problem_ids:
-        problems = [p for p in all_problems if p['ID'] in args.problem_ids.split(',')]
+        include_problem_ids = {pid.strip() for pid in args.problem_ids.split(',') if pid.strip()}
+        problems = [p for p in all_problems if p['ID'] in include_problem_ids]
         print(f"Processing {len(problems)} specified problems")
     elif args.resume and not args.split_jobs:
         problems = [p for p in all_problems if p['ID'] not in completed_problems]
         print(f"Resuming with {len(problems)} remaining problems")
     else:
         problems = all_problems
+
+    if args.skip_problem_ids:
+        skip_problem_ids = {pid.strip() for pid in args.skip_problem_ids.split(',') if pid.strip()}
+        before_skip_count = len(problems)
+        problems = [p for p in problems if p['ID'] not in skip_problem_ids]
+        skipped_count = before_skip_count - len(problems)
+        if skipped_count > 0:
+            print(f"Skipping {skipped_count} specified problems: {','.join(sorted(skip_problem_ids))}")
     
     # Limit problem set for debug or testing
     if args.debug:
@@ -1345,12 +1414,7 @@ def main():
         print("\noverall accuracyll accuracy: {:.2%}".format(overall_accuracy))
     if args.dataset_config_dict.get("answer_type") == "livecodebench":
         print("evaluate livecodebench results")
-        combined_results_path = f"{args.output_dir}/combined_results.csv"
-        if os.path.exists(combined_results_path):
-            os.system(f"python evaluate/livecodebench_answer_extractor.py --csv_path {combined_results_path}")
-            print(f"livecodebench results saved in {args.output_dir}/combined_results_evaluation_light.csv")
-        else:
-            print(f"combined_results.csv not found in {args.output_dir}")
+        run_livecodebench_postprocess(args.output_dir)
 
     # Print comprehensive evaluation metrics at the end
     if not args.split_jobs or args.job_id == -1:
