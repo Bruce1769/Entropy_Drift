@@ -142,6 +142,7 @@ class SLDisaggregationSystem:
         overlap_tp_schedule: bool = False,
         slm_min_batch_size: Union[int, list[int]] = 1,
         llm_min_batch_size: Union[int, list[int]] = 1,
+        trace_reference_topk_k: int = 64,
     ):
         """Initialize the SL Disaggregation System for dynamic model selection.
 
@@ -172,6 +173,7 @@ class SLDisaggregationSystem:
         self.strategy_kwargs = strategy_kwargs or {}
         self.switching_strategy = switching_strategy
         self.is_record = is_record
+        self.trace_reference_topk_k = trace_reference_topk_k
         self.rid = 1
         self.rid_lock = threading.Lock()
         self.tokenizer = None
@@ -245,6 +247,8 @@ class SLDisaggregationSystem:
             llm_kvcache_size=self.llm_kvcache_size,
             min_batch_size=slm_min_batch_size,
             master_port=self.slm_master_port,  # Pass master_port to SLMServer
+            is_record=self.is_record,
+            trace_reference_topk_k=self.trace_reference_topk_k,
         )
 
         try:
@@ -523,6 +527,7 @@ class SLDisaggregationSystem:
                 status="need",
             )
             req.display_progress = display_progress
+            req.r2r_trace_reference_topk_k = int(self.trace_reference_topk_k) if self.is_record else 0
             # Send Req object to worker process via ZMQ
             try:
                 self.req_sender.send_pyobj(req, flags=zmq.NOBLOCK)

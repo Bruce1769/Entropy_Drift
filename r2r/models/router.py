@@ -277,6 +277,25 @@ def load_model(model_path: str, device: str = "cuda", override_init_args: dict =
         The loaded model and its configuration
     """
     model_path_to_load = None
+    if os.path.isdir(model_path):
+        local_candidates = [
+            "default_router.pt",
+            "router.pt",
+            "default_router_sampling.pt",
+        ]
+        for candidate in local_candidates:
+            candidate_path = os.path.join(model_path, candidate)
+            if os.path.exists(candidate_path):
+                model_path_to_load = candidate_path
+                break
+        if model_path_to_load is None:
+            pt_files = sorted(
+                os.path.join(model_path, name)
+                for name in os.listdir(model_path)
+                if name.endswith(".pt")
+            )
+            if pt_files:
+                model_path_to_load = pt_files[0]
     hf_error = None
     try:
         from huggingface_hub import hf_hub_download, list_repo_files

@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Dict, List, Tuple, Callable, Any, Optional
 import re
 from datasets import load_dataset
@@ -24,6 +25,10 @@ ANSWER_PATTERN_MULTICHOICE = r"(?i)Answer[ \t]*:[ \t]*\$?([A-D])\$?"
 
 ## USED FOR MMLU-PRO ###
 choices = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P"]
+DEFAULT_MMLU_INITIAL_PROMPT = (
+    "The following are multiple choice questions about {$}. "
+    "Think step by step and finish with 'Answer: X', where X is the correct option letter.\n\n"
+)
 
 def check_answer_correctness(predicted: str, actual: str, answer_type: str) -> bool:
     """Check if the predicted answer is correct based on the answer type."""
@@ -193,10 +198,17 @@ def format_cot_example(example, including_answer=True):
 
 
 def generate_cot_prompt(val_df, curr, k):
-    prompt = ""
-    with open(f"script/evaluate/eval_configs/mmlu-pro_initial_prompt.txt", "r") as fi:
-        for line in fi.readlines():
-            prompt += line
+    prompt_path = (
+        Path(__file__).resolve().parents[2]
+        / "script"
+        / "evaluate"
+        / "eval_configs"
+        / "mmlu-pro_initial_prompt.txt"
+    )
+    if prompt_path.exists():
+        prompt = prompt_path.read_text()
+    else:
+        prompt = DEFAULT_MMLU_INITIAL_PROMPT
     subject = curr["category"]
     val_df = select_by_category(val_df, subject)
     val_df = val_df[: k]

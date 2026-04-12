@@ -4,9 +4,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+# SGLang may probe model metadata files on the Hub during startup.
+# Force online mode here so partial local caches do not fail immediately.
+unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE HF_DATASETS_OFFLINE 2>/dev/null || true
+
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export CUDA_VISIBLE_DEVICES
 PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_BIN_DIR="$(cd "$(dirname "$PYTHON_BIN")" 2>/dev/null && pwd || true)"
+if [[ -n "$PYTHON_BIN_DIR" ]]; then
+  export PATH="$PYTHON_BIN_DIR:$PATH"
+fi
 
 CONFIG_PATH="${CONFIG_PATH:-config/Qwen3-0.6B+Qwen3-8B.yaml}"
 DATASET="${DATASET:-aime26}"

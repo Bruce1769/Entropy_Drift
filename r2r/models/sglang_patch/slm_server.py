@@ -34,8 +34,47 @@ from r2r.utils.switching import create_switching_strategy
 from r2r.utils.token_manager import SGLangTokenManager
 from r2r.utils.dataclass import ModelOutputs
 from r2r.utils.sampling import sample_token
-from r2r.utils.metrics import extract_topk_logits
+from r2r.utils.metrics import (
+    compute_entropy,
+    compute_js_divergence,
+    compute_sparse_topk_js_divergence,
+    extract_topk_logits,
+)
 from r2r.models.sglang_patch.schedule_req import WaitingReq, SimpleSamplingParams
+
+def _get_router_score(router, index: int) -> Optional[float]:
+    scores = getattr(router, "last_route_scores", None)
+    if scores is None:
+        return None
+    try:
+        return float(scores[index].item())
+    except Exception:
+        try:
+            return float(scores[index])
+        except Exception:
+            return None
+
+def _get_top1_prob(logits: torch.Tensor) -> float:
+    probs = torch.softmax(logits.to(dtype=torch.float32), dim=-1)
+    return float(torch.max(probs).item())
+
+def _ensure_trace(req: Req) -> List[Dict]:
+    if not hasattr(req, "r2r_token_trace"):
+        req.r2r_token_trace = []
+    return req.r2r_token_trace
+
+def _append_trace_entry(req: Req, entry: Dict) -> int:
+    trace = _ensure_trace(req)
+    trace.append(entry)
+    return len(trace) - 1
+
+def _update_trace_entry(req: Req, trace_index: Optional[int], updates: Dict) -> None:
+    if trace_index is None:
+        return
+    trace = getattr(req, "r2r_token_trace", None)
+    if not trace or trace_index >= len(trace):
+        return
+    trace[trace_index].update(updates)
 
 
 class SLMServer:
@@ -53,6 +92,8 @@ class SLMServer:
         llm_kvcache_size: Optional[Value] = None,
         min_batch_size: Union[int, list[int]] = 1,
         master_port: Optional[int] = None,
+        is_record: bool = False,
+        trace_reference_topk_k: int = 64,
     ):
         self.quick_waiting_line = []
         self.is_reset_cache = False
@@ -67,6 +108,8 @@ class SLMServer:
         self.switching_strategy = switching_strategy
         self.strategy_kwargs = strategy_kwargs
         self.master_port = master_port
+        self.is_record = is_record
+        self.trace_reference_topk_k = trace_reference_topk_k
         # Inter-server queues (outbound to LLM / inbound from LLM)
         self.queue_to_llm = mp.Queue()
         # Dedicated outbound sequence counter for messages sent to LLM
@@ -480,6 +523,7 @@ class SLMServer:
                     llm_result = llm_results[req.rid]
                     final_token_id = int(llm_result.new_token_ids[-1])
                     source_model = getattr(llm_result, "final_token_source", None) or "reference"
+                    trace_index = getattr(req, "r2r_pending_trace_index", None)
                     async_speculative = bool(
                         getattr(req, "r2r_async_speculative_pending", False)
                         or getattr(llm_result, "async_speculative", False)
@@ -547,6 +591,45 @@ class SLMServer:
                             if hasattr(req, attr_name):
                                 delattr(req, attr_name)
 
+                    trace_updates = {
+                        "reference_token_id": int(getattr(llm_result, "new_token_ids", [final_token_id])[-1]),
+                        "source_model": source_model,
+                        "output_token_id": final_token_id,
+                    }
+                    ref_logits = getattr(llm_result, "reference_logits", None)
+                    if ref_logits is not None:
+                        ref_logits = ref_logits.detach().cpu()
+                        trace_updates["reference_entropy"] = float(compute_entropy(ref_logits))
+                        trace_updates["reference_top1_prob"] = _get_top1_prob(ref_logits)
+                        quick_logits = getattr(req, "r2r_quick_logits", None)
+                        if quick_logits is not None:
+                            trace_updates["js_divergence"] = float(
+                                compute_js_divergence(
+                                    quick_logits[None, :],
+                                    ref_logits[None, :],
+                                )[0].item()
+                            )
+
+                    ref_topk_indices = getattr(llm_result, "reference_topk_indices", None)
+                    ref_topk_logits = getattr(llm_result, "reference_topk_logits", None)
+                    if ref_topk_indices is not None and ref_topk_logits is not None:
+                        ref_topk_indices = ref_topk_indices.detach().cpu()
+                        ref_topk_logits = ref_topk_logits.detach().cpu()
+                        if ref_topk_indices.numel() > 0:
+                            trace_updates["reference_token_id"] = int(ref_topk_indices[0].item())
+                        quick_topk_indices = getattr(req, "r2r_quick_topk_indices", None)
+                        quick_topk_logits = getattr(req, "r2r_quick_topk_logits", None)
+                        if quick_topk_indices is not None and quick_topk_logits is not None:
+                            trace_updates["js_divergence"] = float(
+                                compute_sparse_topk_js_divergence(
+                                    logits_p=quick_topk_logits[None, :],
+                                    indices_p=quick_topk_indices[None, :],
+                                    logits_q=ref_topk_logits[None, :],
+                                    indices_q=ref_topk_indices[None, :],
+                                )[0].item()
+                            )
+                    _update_trace_entry(req, trace_index, trace_updates)
+
                     if async_speculative:
                         provisional_token_id = getattr(
                             req, "r2r_async_provisional_token_id", None
@@ -588,6 +671,7 @@ class SLMServer:
                     for attr_name in (
                         "r2r_async_speculative_pending",
                         "r2r_async_provisional_token_id",
+                        "r2r_pending_trace_index",
                     ):
                         if hasattr(req, attr_name):
                             delattr(req, attr_name)
@@ -813,80 +897,114 @@ class SLMServer:
             model_choices = router.route(model_outputs).cpu()
         # TODO: merge router into sglang
 
-        # Check if reference model is needed for any prompt
-        reference_needed = torch.any(model_choices)
         req_to_send = []
-        if reference_needed:
-            reference_request = (
-                router.get_reference_distribution_request()
-                if getattr(router, "requires_reference_evaluation", False)
-                else {"mode": None, "topk_k": None, "decision_mode": None, "js_threshold": None}
+        reference_request = (
+            router.get_reference_distribution_request()
+            if getattr(router, "requires_reference_evaluation", False)
+            else {"mode": None, "topk_k": None, "decision_mode": None, "js_threshold": None}
+        )
+        for i, req in enumerate(batch.reqs):
+            quick_logits_cpu = logits[i, 0].detach().cpu()
+            quick_token_id = int(next_token_ids[i].item())
+            quick_entropy = float(compute_entropy(quick_logits_cpu))
+            quick_top1_prob = _get_top1_prob(quick_logits_cpu)
+            router_decision = int(model_choices[i].item())
+            router_threshold = getattr(router, "threshold", None)
+            if router_threshold is None:
+                router_threshold = getattr(router, "entropy_threshold", None)
+
+            trace_index = _append_trace_entry(
+                req,
+                {
+                    "position": int(len(req.output_ids)),
+                    "router_decision": router_decision,
+                    "router_score": _get_router_score(router, i),
+                    "router_threshold": float(router_threshold) if router_threshold is not None else None,
+                    "router_name": router.__class__.__name__,
+                    "quick_token_id": quick_token_id,
+                    "quick_entropy": quick_entropy,
+                    "quick_top1_prob": quick_top1_prob,
+                    "reference_token_id": None,
+                    "reference_entropy": None,
+                    "reference_top1_prob": None,
+                    "js_divergence": None,
+                    "source_model": "quick" if router_decision == 0 else "reference",
+                    "output_token_id": quick_token_id if router_decision == 0 else None,
+                },
             )
-            for i, req in enumerate(batch.reqs):
-                if model_choices[i] == 1:
-                    # TODO: send origin input to LLM to prefill prefix only
-                    req.status = "notneed"
-                    req.r2r_reference_logits_mode = reference_request.get("mode")
-                    req.r2r_reference_topk_k = reference_request.get("topk_k")
-                    req.r2r_reference_decision_mode = reference_request.get("decision_mode")
-                    req.r2r_reference_js_threshold = reference_request.get("js_threshold")
-                    if getattr(router, "requires_reference_evaluation", False):
-                        req.r2r_quick_token_id = int(next_token_ids[i].item())
-                        if reference_request.get("mode") == "full":
-                            req.r2r_quick_logits = logits[i, 0].detach().cpu()
-                        elif reference_request.get("mode") == "topk":
-                            quick_topk_logits, quick_topk_indices = extract_topk_logits(
-                                logits[i, 0].detach(),
-                                reference_request.get("topk_k") or 64,
-                            )
-                            if reference_request.get("decision_mode") in {"llm_sparse_js", "async_llm_sparse_js"}:
-                                quick_topk_indices_cpu = quick_topk_indices.cpu()
-                                quick_topk_logits_cpu = quick_topk_logits.cpu()
-                            else:
-                                req.r2r_quick_topk_indices = quick_topk_indices.cpu()
-                                req.r2r_quick_topk_logits = quick_topk_logits.cpu()
-                    new_token_ids = []
-                    if req.last_llm_loc is None:
-                        req.last_llm_loc = 0
-                        new_token_ids = req.origin_input_ids
-                    new_token_ids = new_token_ids + req.output_ids[req.last_llm_loc:]
-                    req.last_llm_loc = len(req.output_ids)
-                    waiting_req=WaitingReq(
-                        rid=req.rid, 
-                        new_token_ids=new_token_ids, 
-                        sampling_params=SimpleSamplingParams(
-                            temperature = req.sampling_params.temperature, 
-                            top_k = req.sampling_params.top_k, 
-                            top_p = req.sampling_params.top_p, 
-                            max_new_tokens = 1
-                            ),
-                        reference_logits_mode=reference_request.get("mode"),
-                        reference_topk_k=reference_request.get("topk_k"),
-                        reference_decision_mode=reference_request.get("decision_mode"),
-                        reference_js_threshold=reference_request.get("js_threshold"),
-                        )
-                    if (
-                        getattr(router, "requires_reference_evaluation", False)
-                        and reference_request.get("mode") == "full"
-                        and reference_request.get("decision_mode") == "llm_full_js"
-                    ):
-                        waiting_req.quick_logits = logits[i, 0].detach().cpu()
-                        waiting_req.quick_token_id = int(next_token_ids[i].item())
-                    if (
-                        getattr(router, "requires_reference_evaluation", False)
-                        and reference_request.get("mode") == "topk"
-                        and reference_request.get("decision_mode") in {"llm_sparse_js", "async_llm_sparse_js"}
-                    ):
-                        waiting_req.quick_token_id = int(next_token_ids[i].item())
-                        waiting_req.quick_topk_indices = quick_topk_indices_cpu
-                        waiting_req.quick_topk_logits = quick_topk_logits_cpu
-                        waiting_req.async_speculative = (
-                            reference_request.get("decision_mode") == "async_llm_sparse_js"
-                        )
-                    if reference_request.get("decision_mode") == "async_llm_sparse_js":
-                        req.r2r_async_speculative_pending = True
-                        req.r2r_async_provisional_token_id = int(next_token_ids[i].item())
-                    req_to_send.append(waiting_req)
+
+            if router_decision != 1:
+                continue
+
+            req.status = "notneed"
+            trace_topk_k = int(getattr(req, "r2r_trace_reference_topk_k", 0) or 0)
+            req.r2r_reference_logits_mode = reference_request.get("mode")
+            req.r2r_reference_topk_k = reference_request.get("topk_k")
+            req.r2r_reference_decision_mode = reference_request.get("decision_mode")
+            req.r2r_reference_js_threshold = reference_request.get("js_threshold")
+            req.r2r_pending_trace_index = trace_index
+
+            if (
+                not getattr(router, "requires_reference_evaluation", False)
+                and trace_topk_k > 0
+                and req.r2r_reference_logits_mode is None
+            ):
+                req.r2r_reference_logits_mode = "topk"
+                req.r2r_reference_topk_k = trace_topk_k
+
+            req.r2r_quick_token_id = quick_token_id
+            if req.r2r_reference_logits_mode == "full":
+                req.r2r_quick_logits = quick_logits_cpu
+            elif req.r2r_reference_logits_mode == "topk":
+                quick_topk_logits, quick_topk_indices = extract_topk_logits(
+                    logits[i, 0].detach(),
+                    req.r2r_reference_topk_k or 64,
+                )
+                req.r2r_quick_topk_indices = quick_topk_indices.cpu()
+                req.r2r_quick_topk_logits = quick_topk_logits.cpu()
+
+            new_token_ids = []
+            if req.last_llm_loc is None:
+                req.last_llm_loc = 0
+                new_token_ids = req.origin_input_ids
+            new_token_ids = new_token_ids + req.output_ids[req.last_llm_loc:]
+            req.last_llm_loc = len(req.output_ids)
+            waiting_req = WaitingReq(
+                rid=req.rid,
+                new_token_ids=new_token_ids,
+                sampling_params=SimpleSamplingParams(
+                    temperature=req.sampling_params.temperature,
+                    top_k=req.sampling_params.top_k,
+                    top_p=req.sampling_params.top_p,
+                    max_new_tokens=1,
+                ),
+                reference_logits_mode=req.r2r_reference_logits_mode,
+                reference_topk_k=req.r2r_reference_topk_k,
+                reference_decision_mode=req.r2r_reference_decision_mode,
+                reference_js_threshold=req.r2r_reference_js_threshold,
+            )
+            if (
+                getattr(router, "requires_reference_evaluation", False)
+                and req.r2r_reference_logits_mode == "full"
+                and req.r2r_reference_decision_mode == "llm_full_js"
+            ):
+                waiting_req.quick_logits = quick_logits_cpu
+                waiting_req.quick_token_id = quick_token_id
+            if (
+                req.r2r_reference_logits_mode == "topk"
+                and getattr(req, "r2r_quick_topk_indices", None) is not None
+                and getattr(req, "r2r_quick_topk_logits", None) is not None
+            ):
+                waiting_req.quick_token_id = quick_token_id
+                waiting_req.quick_topk_indices = req.r2r_quick_topk_indices
+                waiting_req.quick_topk_logits = req.r2r_quick_topk_logits
+                waiting_req.async_speculative = (
+                    req.r2r_reference_decision_mode == "async_llm_sparse_js"
+                )
+            if req.r2r_reference_decision_mode == "async_llm_sparse_js":
+                req.r2r_async_speculative_pending = True
+                req.r2r_async_provisional_token_id = quick_token_id
+            req_to_send.append(waiting_req)
         return result, req_to_send
 
     @staticmethod
@@ -996,6 +1114,7 @@ class SLMServer:
                     "slm_token_count": slm_count,
                     "llm_token_count": llm_count,
                     "llm_ratio": llm_count / total_count if total_count > 0 else 0.0,
+                    "token_trace": list(getattr(req, "r2r_token_trace", [])),
                 }
                 try:
                     finished_queue.put_nowait(payload)

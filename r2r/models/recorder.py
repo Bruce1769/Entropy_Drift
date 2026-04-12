@@ -19,6 +19,14 @@ class GenerationRecord:
     aleatoric_uncertainty: Optional[float] = None
     epistemic_uncertainty: Optional[float] = None
     reference_model_prediction: Optional[int] = None
+    reference_model_entropy: Optional[float] = None
+    js_divergence: Optional[float] = None
+    router_decision: Optional[int] = None
+    router_score: Optional[float] = None
+    router_threshold: Optional[float] = None
+    router_name: Optional[str] = None
+    quick_top1_prob: Optional[float] = None
+    reference_top1_prob: Optional[float] = None
 
 class GenerationRecorder:
     def __init__(self):

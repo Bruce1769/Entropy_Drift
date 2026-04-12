@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
+# SGLang may probe model metadata files on the Hub during startup.
+# Force online mode here so partial local caches do not fail immediately.
+unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE HF_DATASETS_OFFLINE 2>/dev/null || true
+
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-6,7}"
 export CUDA_VISIBLE_DEVICES
 PYTHON_BIN="${PYTHON_BIN:-python}"

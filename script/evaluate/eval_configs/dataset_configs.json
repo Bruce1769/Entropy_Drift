@@ -69,6 +69,45 @@
         "description": "Multiple-choice questions from MMLU-Pro dataset",
         "selected_subjects": "all"
     },
+    "mmlu_all":{
+        "name": "MMLU",
+        "path": "cais/mmlu",
+        "dataset_config": "all",
+        "answer_type": "mmlu-multiple-choice",
+        "id_field": "question_id",
+        "question_field": "question",
+        "answer_field": "answer",
+        "prompt_template": "",
+        "options_fields": "choices",
+        "description": "Original MMLU multiple-choice benchmark",
+        "selected_subjects": "all"
+    },
+    "mmlu_formal_logic":{
+        "name": "MMLU formal_logic",
+        "path": "cais/mmlu",
+        "dataset_config": "all",
+        "answer_type": "mmlu-multiple-choice",
+        "id_field": "question_id",
+        "question_field": "question",
+        "answer_field": "answer",
+        "prompt_template": "",
+        "options_fields": "choices",
+        "description": "Original MMLU formal_logic subject",
+        "selected_subjects": "formal_logic"
+    },
+    "mmlu_college_mathematics":{
+        "name": "MMLU college_mathematics",
+        "path": "cais/mmlu",
+        "dataset_config": "all",
+        "answer_type": "mmlu-multiple-choice",
+        "id_field": "question_id",
+        "question_field": "question",
+        "answer_field": "answer",
+        "prompt_template": "",
+        "options_fields": "choices",
+        "description": "Original MMLU college_mathematics subject",
+        "selected_subjects": "college_mathematics"
+    },
     "aime25": {
         "name": "AIME Mathematical Problems",
         "path": "yentinglin/aime_2025",

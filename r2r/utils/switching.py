@@ -11,6 +11,7 @@ from tqdm import tqdm
 from r2r.utils.metrics import (
     compute_logu,
     compute_entropy,
+    compute_topk_entropy,
     compute_js_divergence,
     compute_sparse_topk_js_divergence,
     extract_topk_logits,
@@ -38,6 +39,8 @@ class ModelSwitchingStrategy:
 
     def __init__(self, aleatoric_threshold: float = 2.275):
         self.aleatoric_threshold = aleatoric_threshold
+        self.last_route_scores = None
+        self.last_route_metric_name = None
 
         # self.entropy_threshold = 0.35
         # self.aleatoric_threshold = 2.250
@@ -165,12 +168,54 @@ class EntropySwitching(ModelSwitchingStrategy):
         # Compute entropy for each sample in the batch
         model_choices = torch.zeros(batch_size, dtype=torch.int, device=next_token_logits.device)
         
+        entropy_values = compute_entropy(next_token_logits)
+        self.last_route_scores = entropy_values.detach().cpu()
+        self.last_route_metric_name = "entropy"
+
         for i in range(batch_size):
-            entropy = compute_entropy(next_token_logits[i:i+1])
+            entropy = entropy_values[i]
             # 0 = quick (low entropy), 1 = reference (high entropy)
             model_choices[i] = 0 if entropy < self.threshold else 1
         
         # Update state based on batch decisions
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+class EntropyTopKSwitching(ModelSwitchingStrategy):
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        entropy_threshold: Optional[float] = None,
+        entropy_topk_k: Optional[int] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        """Immediate switching based on entropy computed over the top-k support."""
+        super().__init__()
+        self.threshold = float(entropy_threshold) if entropy_threshold is not None else 0.45
+        self.entropy_topk_k = int(entropy_topk_k) if entropy_topk_k is not None else 100
+        if self.entropy_topk_k <= 0:
+            raise ValueError(f"entropy_topk_k must be positive, got {self.entropy_topk_k}")
+        print(
+            f"Using entropy_topk threshold: {self.threshold}, top-k: {self.entropy_topk_k}"
+        )
+
+    def route(self, outputs) -> torch.Tensor:
+        batch_size = outputs.logits.shape[0]
+        next_token_logits = outputs.logits[:, -1, :]
+        model_choices = torch.zeros(batch_size, dtype=torch.int, device=next_token_logits.device)
+
+        entropy_values = compute_topk_entropy(next_token_logits, self.entropy_topk_k)
+        self.last_route_scores = entropy_values.detach().cpu()
+        self.last_route_metric_name = f"entropy_topk_{self.entropy_topk_k}"
+
+        for i in range(batch_size):
+            entropy = entropy_values[i]
+            model_choices[i] = 0 if entropy < self.threshold else 1
+
         self.state.last_model = "reference" if model_choices.any().item() else "quick"
         return model_choices
 
@@ -203,6 +248,8 @@ class EntropyJSSwitching(ModelSwitchingStrategy):
     def get_reference_candidates(self, outputs: ModelOutputs) -> torch.Tensor:
         next_token_logits = outputs.logits[:, -1, :]
         entropy = compute_entropy(next_token_logits)
+        self.last_route_scores = entropy.detach().cpu()
+        self.last_route_metric_name = "entropy"
         return (entropy >= self.entropy_threshold).to(torch.int)
 
     def route_with_reference_logits(
@@ -689,7 +736,7 @@ class NeuralSwitching(ModelSwitchingStrategy):
         # Replay the captured CUDA graph
         g = self.cuda_graphs[batch_size]
         g.replay()
-        
+
         return self.model_choices_buffer[:batch_size]
 
     def route(self, outputs: ModelOutputs) -> torch.Tensor:
@@ -752,6 +799,8 @@ class NeuralSwitching(ModelSwitchingStrategy):
             # Handle different output formats (single output or multi-class)
             if model_output.shape[1] == 1:
                 critical_prob = torch.sigmoid(model_output).squeeze(-1)  # [batch_size]
+                self.last_route_scores = critical_prob.detach().cpu()
+                self.last_route_metric_name = "critical_prob"
                 # Convert probabilities to binary decisions (0 = quick, 1 = reference)
                 model_choices = (critical_prob >= self.threshold).to(torch.int)
             else:
@@ -759,6 +808,8 @@ class NeuralSwitching(ModelSwitchingStrategy):
                 # Classes: 0=match, 1=mismatch, 2=divergent
                 probabilities = torch.softmax(model_output, dim=1)  # [batch_size, num_classes]
                 critical_prob = probabilities[:, 2]  # Get probability of class 2 (divergent)
+                self.last_route_scores = critical_prob.detach().cpu()
+                self.last_route_metric_name = "critical_prob"
                 model_choices = (critical_prob >= self.threshold).to(torch.int)
             
             # For tracking state, we'll keep the most recent decision for each input
@@ -1079,6 +1130,7 @@ def create_switching_strategy(strategy_name: str, **kwargs) -> ModelSwitchingStr
     strategies = {
         'immediate': ImmediateSwitching,
         'entropy': EntropySwitching,
+        'entropy_topk': EntropyTopKSwitching,
         'entropy_js': EntropyJSSwitching,
         'entropy_js_llm': EntropyJSLLMSwitching,
         'entropy_js_topk_sparse': EntropyJSTopKSparseSwitching,

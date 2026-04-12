@@ -1,6 +1,12 @@
 import os
+from pathlib import Path
 import subprocess
 import sys
+
+from r2r.utils.cuda_host_compiler import ensure_cuda_host_compiler_for_jit
+
+ensure_cuda_host_compiler_for_jit()
+
 import time
 import math
 import yaml
@@ -11,10 +17,10 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from datetime import datetime
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 import transformers
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import Dict, List, Tuple, Callable, Any, Optional
+from typing import Dict, List, Tuple, Callable, Any, Optional, Union
 
 os.environ["SGLANG_ENABLE_TORCH_COMPILE"] = "0"
 
@@ -72,6 +78,41 @@ def load_r2r_configs() -> Dict:
 # Load dataset configurations
 DATASET_CONFIGS, MODELS = load_configs()
 R2R_CONFIGS = load_r2r_configs()
+
+
+def resolve_local_model_path(model_path: str) -> str:
+    path = Path(model_path)
+    if path.exists():
+        return str(path)
+
+    if "/" not in model_path:
+        return model_path
+
+    org, repo = model_path.split("/", 1)
+    cache_root = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{org}--{repo}"
+    snapshots_dir = cache_root / "snapshots"
+    refs_main = cache_root / "refs" / "main"
+
+    snapshot_path = None
+    if refs_main.exists():
+        revision = refs_main.read_text().strip()
+        candidate = snapshots_dir / revision
+        if candidate.exists():
+            snapshot_path = candidate
+
+    if snapshot_path is None and snapshots_dir.exists():
+        snapshots = sorted(
+            [snapshot for snapshot in snapshots_dir.iterdir() if snapshot.is_dir()],
+            key=lambda snapshot: snapshot.stat().st_mtime,
+            reverse=True,
+        )
+        if snapshots:
+            snapshot_path = snapshots[0]
+
+    if snapshot_path and snapshot_path.exists():
+        return str(snapshot_path)
+
+    return model_path
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate models on different datasets')
@@ -137,10 +178,14 @@ def parse_args():
                       help='Switching strategy for hybrid model (default: loaded from config, or "neural")')
     parser.add_argument('--is_record', action='store_true',
                       help='Record hybrid model generation')
+    parser.add_argument('--trace_reference_topk_k', type=int, default=64,
+                      help='When recording hybrid generation, request LLM top-k on routed positions for online trace')
     
     # Neural router configuration
     parser.add_argument('--threshold', type=float, default=None,
                       help='Threshold for neural router')
+    parser.add_argument('--entropy_topk_k', type=int, default=None,
+                      help='Top-k size for entropy_topk switching')
     
     parser.add_argument('--config-path', type=str, default=None,
                         help='Path to config.yaml containing router config')
@@ -267,7 +312,12 @@ def process_problems(
         List of result dictionaries containing model outputs and metrics
     """
     # Load tokenizer (common for both approaches)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer_path = resolve_local_model_path(args.model_path)
+    tokenizer_kwargs = {"trust_remote_code": True}
+    if tokenizer_path != args.model_path:
+        tokenizer_kwargs["local_files_only"] = True
+        print(f"Using local tokenizer path: {tokenizer_path}")
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, **tokenizer_kwargs)
     
     # Get dataset configuration
     dataset_config = args.dataset_config_dict
@@ -363,6 +413,8 @@ def process_with_model(
             strategy_kwargs.update({
                 'model_path': router_path,
             })
+            if args.is_record:
+                strategy_kwargs["use_cuda_graph"] = False
             # Priority: config file's router.threshold > command line arg
             threshold = router_config.get("threshold")
             if threshold is None:
@@ -386,6 +438,12 @@ def process_with_model(
             strategy_kwargs.update({
                 'model_path': router_path,
                 'entropy_threshold': router_config.get("entropy_threshold", args.threshold)
+            })
+        elif switching_strategy == 'entropy_topk':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'entropy_threshold': router_config.get("entropy_threshold", args.threshold),
+                'entropy_topk_k': router_config.get("entropy_topk_k", args.entropy_topk_k if args.entropy_topk_k is not None else 100),
             })
         elif switching_strategy == 'entropy_js':
             strategy_kwargs.update({
@@ -426,6 +484,8 @@ def process_with_model(
                 strategy_kwargs["aleatoric_threshold"] = router_config["aleatoric_threshold"]
             if "entropy_threshold" in router_config:
                 strategy_kwargs["entropy_threshold"] = router_config["entropy_threshold"]
+            if "entropy_topk_k" in router_config:
+                strategy_kwargs["entropy_topk_k"] = router_config["entropy_topk_k"]
             if "js_threshold" in router_config:
                 strategy_kwargs["js_threshold"] = router_config["js_threshold"]
             if "js_topk" in router_config:
@@ -459,6 +519,7 @@ def process_with_model(
             switching_strategy=switching_strategy,
             strategy_kwargs=strategy_kwargs,
             is_record=args.is_record,
+            trace_reference_topk_k=args.trace_reference_topk_k,
             **kwargs_init
         )
     else:
@@ -527,8 +588,10 @@ def evaluate_problem(
     # Create temp directory for intermediate results
     temp_dir = os.path.join(args.output_dir, "temp")
     temp_csv_dir = os.path.join(args.output_dir, "temp_csv")
+    token_trace_dir = os.path.join(args.output_dir, "token_traces")
     os.makedirs(temp_dir, exist_ok=True)
     os.makedirs(temp_csv_dir, exist_ok=True)
+    os.makedirs(token_trace_dir, exist_ok=True)
     print(f"Saving intermediate results to {temp_dir}")
     print(f"Saving intermediate csv results to {temp_csv_dir}")
     # Track problem ID occurrences across batches
@@ -700,6 +763,20 @@ def evaluate_problem(
             
             temp_output_path = os.path.join(temp_dir, f"{problem_id}_run_{run_number}.txt")
             temp_output_csv_path = os.path.join(temp_csv_dir, f"{problem_id}_run_{run_number}.csv")
+            if use_hybrid:
+                token_trace = obj.get("token_trace") if isinstance(obj, dict) else None
+                if token_trace:
+                    token_trace_path = os.path.join(
+                        token_trace_dir,
+                        f"{problem_id}_run_{run_number}.csv"
+                    )
+                    save_token_trace_csv(
+                        token_trace=token_trace,
+                        tokenizer=tokenizer,
+                        problem_id=problem_id,
+                        output_path=token_trace_path,
+                    )
+                    result["token_trace_path"] = token_trace_path
             write_to_file(temp_output_path, result)
             write_to_csv(temp_output_csv_path, result)
     
@@ -926,6 +1003,29 @@ def save_progress(output_dir: str, completed_problems: set):
             'last_update': datetime.now().strftime("%Y%m%d_%H%M%S")
         }, f, indent=2)
 
+
+def normalize_mmlu_records(dataset_split) -> List[Dict]:
+    """Normalize MMLU-style records to the structure expected by the existing prompt builder."""
+    normalized_records = []
+    for idx, item in enumerate(dataset_split):
+        record = dict(item)
+        if "options" not in record and "choices" in record:
+            record["options"] = list(record["choices"])
+        if "category" not in record and "subject" in record:
+            record["category"] = record["subject"]
+        if "question_id" not in record:
+            record["question_id"] = idx + 1
+
+        answer = record.get("answer")
+        if isinstance(answer, (int, np.integer)):
+            record["answer"] = chr(65 + int(answer))
+        elif isinstance(answer, str) and answer.isdigit():
+            record["answer"] = chr(65 + int(answer))
+
+        normalized_records.append(record)
+
+    return preprocess(normalized_records)
+
 def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> List[Dict]:
     """Preprocess dataset according to its configuration.
     
@@ -946,8 +1046,13 @@ def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> L
     filter_config = dataset_config.get("filter", None)
     
     if dataset_config.get("answer_type") == "mmlu-multiple-choice":
-        full_test_df = preprocess(dataset["test"])
-        full_val_df = preprocess(dataset["validation"]) if "validation" in dataset else preprocess(dataset["test"])
+        full_test_df = normalize_mmlu_records(dataset["test"])
+        if "validation" in dataset:
+            full_val_df = normalize_mmlu_records(dataset["validation"])
+        elif "dev" in dataset:
+            full_val_df = normalize_mmlu_records(dataset["dev"])
+        else:
+            full_val_df = normalize_mmlu_records(dataset["test"])
         all_subjects = []
         for each in full_test_df:
             if each["category"] not in all_subjects:
@@ -965,14 +1070,17 @@ def preprocess_dataset(dataset, dataset_config: Dict, save_result_dir: str) -> L
         selected_subjects = sorted(selected_subjects)
         with open(os.path.join(save_result_dir, "summary.txt"), 'a') as f:
             f.write("\n------category level sta------\n")
-        dataset = full_test_df
+        dataset = [each for each in full_test_df if each["category"] in selected_subjects]
     
     if filter_config:
         dataset = dataset.filter(lambda x: x[filter_config["key"]] in filter_config["value"])
     
     for idx, item in enumerate(dataset):
+        item_id = item.get(id_field, idx + 1) if hasattr(item, "get") else idx + 1
+        if item_id is None:
+            item_id = idx + 1
         processed_item = {
-            "ID": str(item[id_field]),
+            "ID": str(item_id),
             "Problem": item[question_field],
             "Answer": item[answer_field]
         }
@@ -1249,11 +1357,15 @@ def main():
     
     # Load and preprocess dataset
     print(f"Loading dataset: {args.dataset} from {args.dataset_path}")
-    if args.dataset_config:
-        print(f"Using dataset config: {args.dataset_config}")
-        dataset = load_dataset(args.dataset_path, args.dataset_config)
+    if args.dataset_path and os.path.isdir(args.dataset_path):
+        print(f"Loading dataset from local disk: {args.dataset_path}")
+        dataset = load_from_disk(args.dataset_path)
     else:
-        dataset = load_dataset(args.dataset_path)
+        if args.dataset_config:
+            print(f"Using dataset config: {args.dataset_config}")
+            dataset = load_dataset(args.dataset_path, args.dataset_config)
+        else:
+            dataset = load_dataset(args.dataset_path)
     
     print(f"Preprocessing dataset as {args.dataset_config_dict['name']}")
         
@@ -1506,6 +1618,35 @@ def write_to_csv(output_path: str, result: Dict):
     
     # Save to CSV
     df.to_csv(output_path, index=False)
+
+def save_token_trace_csv(token_trace: List[Dict], tokenizer: AutoTokenizer, problem_id: Union[str, int], output_path: str):
+    rows = []
+    for row in token_trace:
+        quick_token_id = row.get("quick_token_id")
+        reference_token_id = row.get("reference_token_id")
+        output_token_id = row.get("output_token_id")
+        rows.append({
+            "problem_id": problem_id,
+            "position": row.get("position"),
+            "router_decision": row.get("router_decision"),
+            "router_score": row.get("router_score"),
+            "router_threshold": row.get("router_threshold"),
+            "router_name": row.get("router_name"),
+            "source_model": row.get("source_model"),
+            "quick_token_id": quick_token_id,
+            "quick_token_str": tokenizer.decode([quick_token_id]) if quick_token_id is not None else None,
+            "quick_entropy": row.get("quick_entropy"),
+            "quick_top1_prob": row.get("quick_top1_prob"),
+            "reference_token_id": reference_token_id,
+            "reference_token_str": tokenizer.decode([reference_token_id]) if reference_token_id is not None else None,
+            "reference_entropy": row.get("reference_entropy"),
+            "reference_top1_prob": row.get("reference_top1_prob"),
+            "js_divergence": row.get("js_divergence"),
+            "output_token_id": output_token_id,
+            "output_token_str": tokenizer.decode([output_token_id]) if output_token_id is not None else None,
+        })
+
+    pd.DataFrame(rows).to_csv(output_path, index=False)
     
     
 if __name__ == "__main__":

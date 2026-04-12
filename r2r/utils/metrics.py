@@ -23,6 +23,38 @@ def compute_entropy(logits: torch.Tensor) -> Union[float, torch.Tensor]:
     
     return entropy.item() if is_single_input else entropy
 
+def compute_topk_entropy(
+    logits: torch.Tensor, topk: int
+) -> Union[float, torch.Tensor]:
+    """
+    Calculate entropy on the truncated top-k support only.
+
+    The selected top-k logits are re-normalized with a softmax over the retained
+    support before entropy is computed. This is a cheaper proxy than full-vocab
+    entropy and will generally underestimate the true entropy.
+
+    Args:
+        logits: Unnormalized logits of shape [vocab_size] or [batch_size, vocab_size]
+        topk: Number of top logits to retain
+
+    Returns:
+        Entropy values as a scalar (if single input) or tensor of shape [batch_size]
+    """
+    if topk <= 0:
+        raise ValueError(f"topk must be positive, got {topk}")
+
+    is_single_input = logits.dim() == 1
+    if is_single_input:
+        logits = logits.unsqueeze(0)
+
+    k = min(int(topk), logits.shape[-1])
+    topk_logits, _ = torch.topk(logits, k=k, dim=-1)
+    topk_probs = F.softmax(topk_logits, dim=-1)
+    topk_log_probs = F.log_softmax(topk_logits, dim=-1)
+    entropy = -torch.sum(topk_probs * topk_log_probs, dim=-1)
+
+    return entropy.item() if is_single_input else entropy
+
 def compute_logu(logits: torch.Tensor, topk: int = 10) -> Tuple[Union[float, torch.Tensor], Union[float, torch.Tensor]]:
     """
     Calculate log-u score of the prediction distribution.
