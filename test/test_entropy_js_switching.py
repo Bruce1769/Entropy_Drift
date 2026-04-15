@@ -3,6 +3,7 @@ import torch
 from r2r.utils.dataclass import ModelOutputs
 from r2r.utils.metrics import compute_js_divergence, compute_sparse_topk_js_divergence
 from r2r.utils.switching import (
+    EntropyDriftSwitching,
     EntropyJSSwitching,
     EntropyJSLLMSwitching,
     EntropyJSTopKAsyncSwitching,
@@ -191,3 +192,95 @@ def test_entropy_js_topk_async_reports_async_llm_side_decision_request():
         "decision_mode": "async_llm_sparse_js",
         "js_threshold": 0.2,
     }
+
+
+def test_entropy_drift_resets_state_for_new_sequence():
+    switching = EntropyDriftSwitching(
+        alpha=0.3,
+        bias=0.5,
+        tau=0.2,
+        warmup_steps=1,
+        stochastic=False,
+    )
+    logits = torch.tensor(
+        [
+            [[10.0, -10.0, -10.0]],
+            [[1.0, 1.0, 1.0]],
+        ]
+    )
+    outputs = ModelOutputs(
+        logits=logits,
+        hidden_states=[torch.zeros(2, 1, 4)],
+        token=torch.tensor([[0], [0]]),
+        sequence_ids=["sample-a", "sample-b"],
+        positions=[0, 0],
+    )
+
+    assert switching.route(outputs).tolist() == [0, 0]
+
+
+def test_entropy_drift_hysteresis_and_hold_reduce_flicker():
+    switching = EntropyDriftSwitching(
+        alpha=0.5,
+        bias=0.2,
+        tau=0.2,
+        warmup_steps=1,
+        hysteresis=0.15,
+        hold_tokens=2,
+        stochastic=False,
+    )
+
+    warmup = ModelOutputs(
+        logits=torch.tensor([[[10.0, -10.0, -10.0]]]),
+        hidden_states=[torch.zeros(1, 1, 4)],
+        token=torch.tensor([[0]]),
+        sequence_ids=["sample-a"],
+        positions=[0],
+    )
+    high_drift = ModelOutputs(
+        logits=torch.tensor([[[0.0, 0.0, 0.0]]]),
+        hidden_states=[torch.zeros(1, 1, 4)],
+        token=torch.tensor([[0]]),
+        sequence_ids=["sample-a"],
+        positions=[1],
+    )
+    low_drift = ModelOutputs(
+        logits=torch.tensor([[[10.0, -10.0, -10.0]]]),
+        hidden_states=[torch.zeros(1, 1, 4)],
+        token=torch.tensor([[0]]),
+        sequence_ids=["sample-a"],
+        positions=[2],
+    )
+
+    assert switching.route(warmup).tolist() == [0]
+    assert switching.route(high_drift).tolist() == [1]
+    assert switching.route(low_drift).tolist() == [1]
+
+
+def test_entropy_drift_confidence_filter_blocks_easy_escalations():
+    switching = EntropyDriftSwitching(
+        alpha=0.5,
+        bias=0.2,
+        tau=0.2,
+        warmup_steps=1,
+        max_confident_prob=0.8,
+        stochastic=False,
+    )
+
+    warmup = ModelOutputs(
+        logits=torch.tensor([[[10.0, -10.0, -10.0]]]),
+        hidden_states=[torch.zeros(1, 1, 4)],
+        token=torch.tensor([[0]]),
+        sequence_ids=["sample-a"],
+        positions=[0],
+    )
+    confident = ModelOutputs(
+        logits=torch.tensor([[[3.0, 0.0, -1.0]]]),
+        hidden_states=[torch.zeros(1, 1, 4)],
+        token=torch.tensor([[0]]),
+        sequence_ids=["sample-a"],
+        positions=[1],
+    )
+
+    assert switching.route(warmup).tolist() == [0]
+    assert switching.route(confident).tolist() == [0]

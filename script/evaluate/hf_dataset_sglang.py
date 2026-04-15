@@ -1,4 +1,5 @@
 import os
+import random
 from pathlib import Path
 import subprocess
 import sys
@@ -37,8 +38,13 @@ from sglang.srt.hf_transformers_utils import get_tokenizer
 import multiprocessing as mp
 import warnings
 
-# set numpy random seed
-np.random.seed(42)
+def set_global_random_seed(seed: int) -> None:
+    """Seed Python / NumPy / PyTorch RNGs in this process."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # Suppress all warnings
 warnings.filterwarnings("ignore")
@@ -78,6 +84,18 @@ def load_r2r_configs() -> Dict:
 # Load dataset configurations
 DATASET_CONFIGS, MODELS = load_configs()
 R2R_CONFIGS = load_r2r_configs()
+
+# CLI/config aliases for switching strategy names (canonical keys use underscores).
+_SWITCHING_STRATEGY_ALIASES = {
+    "entropydrift": "entropy_drift",
+}
+
+
+def normalize_switching_strategy(name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    key = str(name).strip().lower()
+    return _SWITCHING_STRATEGY_ALIASES.get(key, name)
 
 
 def resolve_local_model_path(model_path: str) -> str:
@@ -151,6 +169,8 @@ def parse_args():
                       help='Top-p for the model')
     parser.add_argument('--top_k', type=int, default=-1,
                     help='Top-k filtering parameter for sampling (default: -1)')
+    parser.add_argument('--random_seed', type=int, default=42,
+                        help='RNG seed for sampling and SGLang workers (passed to ServerArgs.random_seed)')
 
     parser.add_argument('--dp_size', type=int, default=1, help='Number of data parallel GPUs')
     parser.add_argument('--tp_size', type=int, default=2, help='Number of tensor parallel GPUs')
@@ -180,12 +200,36 @@ def parse_args():
                       help='Record hybrid model generation')
     parser.add_argument('--trace_reference_topk_k', type=int, default=64,
                       help='When recording hybrid generation, request LLM top-k on routed positions for online trace')
+    parser.add_argument('--trace_reference_for_all_positions', action='store_true',
+                      help='When recording, evaluate the reference model on every generated position while keeping the entropy-router output token unchanged')
+    parser.add_argument('--trace_logits_topk_k', type=int, default=0,
+                      help='When recording, save quick/reference top-k token ids and logits per position into token_traces CSV')
     
     # Neural router configuration
     parser.add_argument('--threshold', type=float, default=None,
                       help='Threshold for neural router')
     parser.add_argument('--entropy_topk_k', type=int, default=None,
                       help='Top-k size for entropy_topk switching')
+    parser.add_argument('--drift_alpha', type=float, default=None,
+                      help='entropy_drift EMA alpha (overrides config router.alpha)')
+    parser.add_argument('--drift_bias', type=float, default=None,
+                      help='entropy_drift sigmoid bias (overrides config router.bias)')
+    parser.add_argument('--drift_tau', type=float, default=None,
+                      help='entropy_drift sigmoid temperature tau (overrides config router.tau)')
+    parser.add_argument('--drift_warmup_steps', type=int, default=None,
+                      help='entropy_drift warmup steps on SLM only (overrides config router.warmup_steps)')
+    parser.add_argument('--drift_random_seed', type=int, default=None,
+                      help='entropy_drift RNG seed for stochastic routing (overrides config router.random_seed)')
+    parser.add_argument('--drift_hysteresis', type=float, default=None,
+                      help='entropy_drift hysteresis width before switching back down')
+    parser.add_argument('--drift_hold_tokens', type=int, default=None,
+                      help='entropy_drift minimum number of reference-held tokens after an up-switch')
+    parser.add_argument('--drift_max_confident_prob', type=float, default=None,
+                      help='Block entropy_drift escalation when quick top-1 probability exceeds this value')
+    parser.add_argument('--drift_min_entropy', type=float, default=None,
+                      help='Optional entropy floor required before entropy_drift can escalate')
+    parser.add_argument('--drift_stochastic', action='store_true',
+                      help='Use stochastic sigmoid sampling for entropy_drift instead of deterministic hysteresis')
     
     parser.add_argument('--config-path', type=str, default=None,
                         help='Path to config.yaml containing router config')
@@ -388,6 +432,7 @@ def process_with_model(
             switching_strategy = args.switching_strategy
         if switching_strategy is None:
             switching_strategy = "neural"
+        switching_strategy = normalize_switching_strategy(switching_strategy)
         
         # Determine router path from config
         router_path = router_config.get("router_path")
@@ -439,11 +484,47 @@ def process_with_model(
                 'model_path': router_path,
                 'entropy_threshold': router_config.get("entropy_threshold", args.threshold)
             })
+        elif switching_strategy == 'entropy_drift':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'alpha': args.drift_alpha if args.drift_alpha is not None else router_config.get("alpha", 0.1),
+                'bias': args.drift_bias if args.drift_bias is not None else router_config.get("bias", 0.0),
+                'tau': args.drift_tau if args.drift_tau is not None else router_config.get("tau", 0.5),
+                'warmup_steps': args.drift_warmup_steps if args.drift_warmup_steps is not None else router_config.get("warmup_steps", 10),
+                'random_seed': args.drift_random_seed if args.drift_random_seed is not None else router_config.get("random_seed", 42),
+                'hysteresis': args.drift_hysteresis if args.drift_hysteresis is not None else router_config.get("hysteresis", 0.0),
+                'hold_tokens': args.drift_hold_tokens if args.drift_hold_tokens is not None else router_config.get("hold_tokens", 0),
+                'max_confident_prob': args.drift_max_confident_prob if args.drift_max_confident_prob is not None else router_config.get("max_confident_prob"),
+                'min_entropy': args.drift_min_entropy if args.drift_min_entropy is not None else router_config.get("min_entropy"),
+                'stochastic': True if args.drift_stochastic else router_config.get("stochastic", True),
+            })
         elif switching_strategy == 'entropy_topk':
             strategy_kwargs.update({
                 'model_path': router_path,
                 'entropy_threshold': router_config.get("entropy_threshold", args.threshold),
                 'entropy_topk_k': router_config.get("entropy_topk_k", args.entropy_topk_k if args.entropy_topk_k is not None else 100),
+            })
+        elif switching_strategy == 'js':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'js_threshold': router_config.get("js_threshold", 0.2),
+            })
+        elif switching_strategy == 'js_llm':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'js_threshold': router_config.get("js_threshold", 0.2),
+            })
+        elif switching_strategy == 'js_topk_sparse':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'js_threshold': router_config.get("js_threshold", 0.2),
+                'js_topk': router_config.get("js_topk", 64),
+            })
+        elif switching_strategy == 'js_topk_llm':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'js_threshold': router_config.get("js_threshold", 0.2),
+                'js_topk': router_config.get("js_topk", 64),
             })
         elif switching_strategy == 'entropy_js':
             strategy_kwargs.update({
@@ -501,10 +582,12 @@ def process_with_model(
                     "dtype": "bfloat16",
                     "tp_size": args.slm_tp_size,
                     "enable_return_hidden_states": True,
+                    "random_seed": args.random_seed,
                 },
                 "reference_sglang_kwargs": {
                     "dtype": "bfloat16",
                     "tp_size": args.llm_tp_size,
+                    "random_seed": args.random_seed,
                 },
                 "overlap_tp_schedule": args.overlap_tp_schedule,
             }
@@ -520,6 +603,8 @@ def process_with_model(
             strategy_kwargs=strategy_kwargs,
             is_record=args.is_record,
             trace_reference_topk_k=args.trace_reference_topk_k,
+            trace_reference_for_all_positions=args.trace_reference_for_all_positions,
+            trace_logits_topk_k=args.trace_logits_topk_k,
             **kwargs_init
         )
     else:
@@ -532,6 +617,7 @@ def process_with_model(
             skip_tokenizer_init=False,
             tp_size=args.tp_size,
             dp_size=args.dp_size,
+            random_seed=args.random_seed,
         )
         sampling_params = {
             "max_new_tokens": args.max_new_tokens,
@@ -693,12 +779,15 @@ def evaluate_problem(
                 if isinstance(obj, dict):
                     slm_token_count = obj.get("slm_token_count", 0)
                     llm_token_count = obj.get("llm_token_count", 0)
+                    reference_eval_count = obj.get("reference_eval_count", llm_token_count)
                 else:
                     slm_token_count = getattr(obj, "slm_token_count", 0)
                     llm_token_count = getattr(obj, "llm_token_count", 0)
+                    reference_eval_count = getattr(obj, "reference_eval_count", llm_token_count)
                 total_model_tokens = slm_token_count + llm_token_count
                 quick_model_percentage = (slm_token_count / total_model_tokens * 100) if total_model_tokens > 0 else 0
                 reference_model_percentage = (llm_token_count / total_model_tokens * 100) if total_model_tokens > 0 else 0
+                reference_eval_ratio = (reference_eval_count / output_tokens * 100) if output_tokens > 0 else 0
 
                 quick_param = float(args.model_config.get("quick", {}).get("param", 0))
                 ref_param = float(args.model_config.get("reference", {}).get("param", 0))
@@ -708,6 +797,7 @@ def evaluate_problem(
                 print(f"Total tokens: {total_model_tokens}")
                 print(f"Quick model tokens: {slm_token_count} ({quick_model_percentage:.1f}%)")
                 print(f"Reference model tokens: {llm_token_count} ({reference_model_percentage:.1f}%)")
+                print(f"Reference evaluations: {reference_eval_count} ({reference_eval_ratio:.1f}% of generated tokens)")
                 print(f"Total parameters used: {total_params_billions:.1f}B")
                 print(f"Average parameters per token: {avg_params_billions:.1f}B")
                 
@@ -723,6 +813,8 @@ def evaluate_problem(
                 "full_output": generated_text,
                 "quick_model_percentage": quick_model_percentage,
                 "reference_model_percentage": reference_model_percentage,
+                "reference_eval_count": reference_eval_count,
+                "reference_eval_ratio": reference_eval_ratio,
                 "model_agreement_percentage": 0,
                 "quick_source_agreement_percentage": 0,
                 "total_params_billions": total_params_billions,
@@ -893,12 +985,12 @@ def combine_results(output_dir: str) -> Dict:
     
     # Calculate percentage column averages
     for col in ['quick_model_percentage', 'reference_model_percentage', 
-                'model_agreement_percentage', 'quick_source_agreement_percentage']:
+                'reference_eval_ratio', 'model_agreement_percentage', 'quick_source_agreement_percentage']:
         if col in combined_df.columns:
             stats[f'avg_{col}'] = float(combined_df[col].mean())
     
     # Calculate token usage averages
-    for col in ['input_tokens', 'output_tokens', 'total_tokens']:
+    for col in ['input_tokens', 'output_tokens', 'total_tokens', 'reference_eval_count']:
         if col in combined_df.columns:
             stats[f'avg_{col}'] = float(combined_df[col].mean())
     
@@ -1303,6 +1395,10 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
                 avg_ref_percentage = df['reference_model_percentage'].mean()
                 print(f"Quick model usage: {avg_quick_percentage:.1f}%")
                 print(f"Reference model usage: {avg_ref_percentage:.1f}%")
+                if 'reference_eval_ratio' in df.columns:
+                    avg_reference_eval_ratio = df['reference_eval_ratio'].mean()
+                    avg_reference_eval_count = df['reference_eval_count'].mean() if 'reference_eval_count' in df.columns else 0.0
+                    print(f"Reference evaluations: {avg_reference_eval_count:.1f} per sample ({avg_reference_eval_ratio:.1f}% of generated tokens)")
                 
                 if 'model_agreement_percentage' in df.columns:
                     avg_agreement = df['model_agreement_percentage'].mean()
@@ -1342,6 +1438,8 @@ def print_evaluation_metrics(args: argparse.Namespace, output_dir: str, all_prob
 
 def main():
     args = parse_args()
+    set_global_random_seed(args.random_seed)
+    print(f"Global random seed: {args.random_seed}")
     os.makedirs(args.output_dir, exist_ok=True)
     
     model_config = args.model_config
@@ -1569,6 +1667,9 @@ def write_to_file(output_path: str, result: Dict):
         if 'quick_model_percentage' in result:
             f.write(f"\nQuick model percentage: {result['quick_model_percentage']}\n")
             f.write(f"Reference model percentage: {result['reference_model_percentage']}\n")
+            if 'reference_eval_count' in result:
+                f.write(f"Reference eval count: {result['reference_eval_count']}\n")
+                f.write(f"Reference eval ratio: {result['reference_eval_ratio']}\n")
             f.write(f"Model agreement percentage: {result['model_agreement_percentage']}\n")
             f.write(f"Quick source agreement percentage: {result['quick_source_agreement_percentage']}\n")
             f.write(f"Total parameters billions: {result['total_params_billions']}\n")
@@ -1606,6 +1707,9 @@ def write_to_csv(output_path: str, result: Dict):
     if 'quick_model_percentage' in result:
         df['quick_model_percentage'] = result['quick_model_percentage']
         df['reference_model_percentage'] = result['reference_model_percentage']
+        if 'reference_eval_count' in result:
+            df['reference_eval_count'] = result['reference_eval_count']
+            df['reference_eval_ratio'] = result['reference_eval_ratio']
         df['model_agreement_percentage'] = result['model_agreement_percentage']
         df['quick_source_agreement_percentage'] = result['quick_source_agreement_percentage']
         df['total_params_billions'] = result['total_params_billions']
@@ -1620,6 +1724,11 @@ def write_to_csv(output_path: str, result: Dict):
     df.to_csv(output_path, index=False)
 
 def save_token_trace_csv(token_trace: List[Dict], tokenizer: AutoTokenizer, problem_id: Union[str, int], output_path: str):
+    def _json_cell(value):
+        if value is None:
+            return None
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
     rows = []
     for row in token_trace:
         quick_token_id = row.get("quick_token_id")
@@ -1642,6 +1751,10 @@ def save_token_trace_csv(token_trace: List[Dict], tokenizer: AutoTokenizer, prob
             "reference_entropy": row.get("reference_entropy"),
             "reference_top1_prob": row.get("reference_top1_prob"),
             "js_divergence": row.get("js_divergence"),
+            "quick_topk_token_ids": _json_cell(row.get("quick_topk_token_ids")),
+            "quick_topk_logits": _json_cell(row.get("quick_topk_logits")),
+            "reference_topk_token_ids": _json_cell(row.get("reference_topk_token_ids")),
+            "reference_topk_logits": _json_cell(row.get("reference_topk_logits")),
             "output_token_id": output_token_id,
             "output_token_str": tokenizer.decode([output_token_id]) if output_token_id is not None else None,
         })

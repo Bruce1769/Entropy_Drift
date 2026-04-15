@@ -94,6 +94,8 @@ class SLMServer:
         master_port: Optional[int] = None,
         is_record: bool = False,
         trace_reference_topk_k: int = 64,
+        trace_reference_for_all_positions: bool = False,
+        trace_logits_topk_k: int = 0,
     ):
         self.quick_waiting_line = []
         self.is_reset_cache = False
@@ -110,6 +112,8 @@ class SLMServer:
         self.master_port = master_port
         self.is_record = is_record
         self.trace_reference_topk_k = trace_reference_topk_k
+        self.trace_reference_for_all_positions = bool(trace_reference_for_all_positions)
+        self.trace_logits_topk_k = int(trace_logits_topk_k)
         # Inter-server queues (outbound to LLM / inbound from LLM)
         self.queue_to_llm = mp.Queue()
         # Dedicated outbound sequence counter for messages sent to LLM
@@ -239,6 +243,8 @@ class SLMServer:
                     llm_kvcache_size,
                     min_batch_size,
                     self.master_port,  # Pass master_port to worker
+                    self.trace_reference_for_all_positions,
+                    self.trace_logits_topk_k,
                 ),
             )
             proc.start()
@@ -289,6 +295,8 @@ class SLMServer:
         llm_kvcache_size: Optional[Value] = None,
         min_batch_size: Union[int, list[int]] = 1,
         master_port: Optional[int] = None,
+        trace_reference_for_all_positions: bool = False,
+        trace_logits_topk_k: int = 0,
     ):
         scheduler = None
         try:
@@ -377,7 +385,13 @@ class SLMServer:
                     nvtx.push_range("SLM")
                 batch = scheduler.get_next_batch_to_run()
                 if batch:
-                    result, req_to_send = SLMServer.run_batch(batch, scheduler, router)
+                    result, req_to_send = SLMServer.run_batch(
+                        batch,
+                        scheduler,
+                        router,
+                        trace_reference_for_all_positions=trace_reference_for_all_positions,
+                        default_trace_logits_topk_k=trace_logits_topk_k,
+                    )
                     SLMServer.process_batch_results(batch, result, scheduler, finished_queue, outbound_queue, rank, req_to_send)
                     scheduler.last_batch=batch
                     if rank == 0:
@@ -592,10 +606,28 @@ class SLMServer:
                                 delattr(req, attr_name)
 
                     trace_updates = {
-                        "reference_token_id": int(getattr(llm_result, "new_token_ids", [final_token_id])[-1]),
+                        "reference_token_id": int(
+                            getattr(
+                                llm_result,
+                                "reference_token_id",
+                                getattr(llm_result, "new_token_ids", [final_token_id])[-1],
+                            )
+                        ),
                         "source_model": source_model,
                         "output_token_id": final_token_id,
                     }
+                    if getattr(llm_result, "reference_entropy", None) is not None:
+                        trace_updates["reference_entropy"] = float(
+                            llm_result.reference_entropy
+                        )
+                    if getattr(llm_result, "reference_top1_prob", None) is not None:
+                        trace_updates["reference_top1_prob"] = float(
+                            llm_result.reference_top1_prob
+                        )
+                    if getattr(llm_result, "js_divergence", None) is not None:
+                        trace_updates["js_divergence"] = float(llm_result.js_divergence)
+                        if getattr(router, "trace_router_score_from_js", False):
+                            trace_updates["router_score"] = float(llm_result.js_divergence)
                     ref_logits = getattr(llm_result, "reference_logits", None)
                     if ref_logits is not None:
                         ref_logits = ref_logits.detach().cpu()
@@ -608,6 +640,22 @@ class SLMServer:
                                     quick_logits[None, :],
                                     ref_logits[None, :],
                                 )[0].item()
+                            )
+                            if getattr(router, "trace_router_score_from_js", False):
+                                trace_updates["router_score"] = trace_updates["js_divergence"]
+                        trace_logits_topk_k = int(
+                            getattr(req, "r2r_trace_logits_topk_k", 0) or 0
+                        )
+                        if trace_logits_topk_k > 0:
+                            ref_trace_topk_logits, ref_trace_topk_indices = extract_topk_logits(
+                                ref_logits,
+                                trace_logits_topk_k,
+                            )
+                            trace_updates["reference_topk_token_ids"] = (
+                                ref_trace_topk_indices.cpu().tolist()
+                            )
+                            trace_updates["reference_topk_logits"] = (
+                                ref_trace_topk_logits.to(dtype=torch.float32).cpu().tolist()
                             )
 
                     ref_topk_indices = getattr(llm_result, "reference_topk_indices", None)
@@ -628,6 +676,8 @@ class SLMServer:
                                     indices_q=ref_topk_indices[None, :],
                                 )[0].item()
                             )
+                            if getattr(router, "trace_router_score_from_js", False):
+                                trace_updates["router_score"] = trace_updates["js_divergence"]
                     _update_trace_entry(req, trace_index, trace_updates)
 
                     if async_speculative:
@@ -881,7 +931,13 @@ class SLMServer:
         return recv_reqs
 
     @staticmethod
-    def run_batch(batch: ScheduleBatch, scheduler: Scheduler, router):
+    def run_batch(
+        batch: ScheduleBatch,
+        scheduler: Scheduler,
+        router,
+        trace_reference_for_all_positions: bool = False,
+        default_trace_logits_topk_k: int = 0,
+    ):
         result = scheduler.run_batch(batch)
         batch, hidden_states, logits, next_token_ids = SLMServer.process_routing_input(batch, result)
         # Create a ModelOutputs object for switching strategy
@@ -889,6 +945,8 @@ class SLMServer:
             logits=logits,
             hidden_states=[hidden_states],  # dummy layer dimension
             token=next_token_ids[:, None],
+            sequence_ids=[getattr(req, "rid", None) for req in batch.reqs],
+            positions=[int(len(req.output_ids)) for req in batch.reqs],
         )
         # Use switching strategy to decide which model to use for each input
         if getattr(router, "requires_reference_evaluation", False):
@@ -909,34 +967,51 @@ class SLMServer:
             quick_entropy = float(compute_entropy(quick_logits_cpu))
             quick_top1_prob = _get_top1_prob(quick_logits_cpu)
             router_decision = int(model_choices[i].item())
+            trace_force_reference = bool(
+                getattr(req, "r2r_trace_reference_for_all_positions", False)
+                or trace_reference_for_all_positions
+            )
+            trace_logits_topk_k = int(
+                getattr(req, "r2r_trace_logits_topk_k", 0) or default_trace_logits_topk_k
+            )
             router_threshold = getattr(router, "threshold", None)
             if router_threshold is None:
                 router_threshold = getattr(router, "entropy_threshold", None)
+            if router_threshold is None:
+                router_threshold = getattr(router, "js_threshold", None)
 
-            trace_index = _append_trace_entry(
-                req,
-                {
-                    "position": int(len(req.output_ids)),
-                    "router_decision": router_decision,
-                    "router_score": _get_router_score(router, i),
-                    "router_threshold": float(router_threshold) if router_threshold is not None else None,
-                    "router_name": router.__class__.__name__,
-                    "quick_token_id": quick_token_id,
-                    "quick_entropy": quick_entropy,
-                    "quick_top1_prob": quick_top1_prob,
-                    "reference_token_id": None,
-                    "reference_entropy": None,
-                    "reference_top1_prob": None,
-                    "js_divergence": None,
-                    "source_model": "quick" if router_decision == 0 else "reference",
-                    "output_token_id": quick_token_id if router_decision == 0 else None,
-                },
-            )
+            trace_entry = {
+                "position": int(len(req.output_ids)),
+                "router_decision": router_decision,
+                "router_score": _get_router_score(router, i),
+                "router_threshold": float(router_threshold) if router_threshold is not None else None,
+                "router_name": router.__class__.__name__,
+                "quick_token_id": quick_token_id,
+                "quick_entropy": quick_entropy,
+                "quick_top1_prob": quick_top1_prob,
+                "reference_token_id": None,
+                "reference_entropy": None,
+                "reference_top1_prob": None,
+                "js_divergence": None,
+                "source_model": "quick" if router_decision == 0 else "reference",
+                "output_token_id": quick_token_id if router_decision == 0 else None,
+            }
+            if trace_logits_topk_k > 0:
+                quick_trace_topk_logits, quick_trace_topk_indices = extract_topk_logits(
+                    quick_logits_cpu,
+                    trace_logits_topk_k,
+                )
+                trace_entry["quick_topk_token_ids"] = quick_trace_topk_indices.cpu().tolist()
+                trace_entry["quick_topk_logits"] = (
+                    quick_trace_topk_logits.to(dtype=torch.float32).cpu().tolist()
+                )
+            trace_index = _append_trace_entry(req, trace_entry)
 
-            if router_decision != 1:
+            if router_decision != 1 and not trace_force_reference:
                 continue
 
             req.status = "notneed"
+            req.reference_eval_count = getattr(req, "reference_eval_count", 0) + 1
             trace_topk_k = int(getattr(req, "r2r_trace_reference_topk_k", 0) or 0)
             req.r2r_reference_logits_mode = reference_request.get("mode")
             req.r2r_reference_topk_k = reference_request.get("topk_k")
@@ -944,6 +1019,8 @@ class SLMServer:
             req.r2r_reference_js_threshold = reference_request.get("js_threshold")
             req.r2r_pending_trace_index = trace_index
 
+            if trace_force_reference and req.r2r_reference_logits_mode is None:
+                req.r2r_reference_logits_mode = "full"
             if (
                 not getattr(router, "requires_reference_evaluation", False)
                 and trace_topk_k > 0
@@ -953,6 +1030,7 @@ class SLMServer:
                 req.r2r_reference_topk_k = trace_topk_k
 
             req.r2r_quick_token_id = quick_token_id
+            req.r2r_use_reference_output = (router_decision == 1)
             if req.r2r_reference_logits_mode == "full":
                 req.r2r_quick_logits = quick_logits_cpu
             elif req.r2r_reference_logits_mode == "topk":
@@ -982,6 +1060,7 @@ class SLMServer:
                 reference_topk_k=req.r2r_reference_topk_k,
                 reference_decision_mode=req.r2r_reference_decision_mode,
                 reference_js_threshold=req.r2r_reference_js_threshold,
+                use_reference_output=req.r2r_use_reference_output,
             )
             if (
                 getattr(router, "requires_reference_evaluation", False)
@@ -1103,6 +1182,7 @@ class SLMServer:
             if finished_queue is not None:
                 slm_count = getattr(req, 'slm_token_count', 0)
                 llm_count = getattr(req, 'llm_token_count', 0)
+                reference_eval_count = getattr(req, "reference_eval_count", 0)
                 total_count = slm_count + llm_count
                 payload = {
                     "rid": getattr(req, "rid", None),
@@ -1113,6 +1193,7 @@ class SLMServer:
                     "status": "finished",
                     "slm_token_count": slm_count,
                     "llm_token_count": llm_count,
+                    "reference_eval_count": reference_eval_count,
                     "llm_ratio": llm_count / total_count if total_count > 0 else 0.0,
                     "token_trace": list(getattr(req, "r2r_token_trace", [])),
                 }

@@ -1,0 +1,55 @@
+{
+  "special_tokens": {
+    "think_start": 151667,
+    "think_end": 151668
+  },
+  "quick": {
+    "model_name": "Qwen3-0.6B",
+    "model_path": "/remote-home/pxl/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
+    "param": "0.6",
+    "mem_fraction_static": 0.30
+  },
+  "reference": {
+    "model_name": "Qwen3-8B",
+    "model_path": "/remote-home/pxl/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+    "param": "8",
+    "mem_fraction_static": 0.80
+  },
+  "continuation_main": {
+    "model_name": "Qwen3-8B",
+    "model_path": "/remote-home/pxl/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+    "param": "8",
+    "tp_size": 2,
+    "base_gpu_id": 2,
+    "mem_fraction_static": 0.90
+  },
+  "continuation_reference": {
+    "model_name": "Qwen3-8B",
+    "model_path": "/remote-home/pxl/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218",
+    "param": "8",
+    "tp_size": 1,
+    "base_gpu_id": 3,
+    "mem_fraction_static": 0.90
+  },
+  "verify": {
+    "model_name": "Qwen2.5-72B-Instruct",
+    "model_path": "Qwen/Qwen2.5-72B-Instruct",
+    "mem_fraction_static": 0.90,
+    "max_new_tokens": 16,
+    "base_gpu_id": 4,
+    "tp_size": 4
+  },
+  "router": {
+    "router_name": "Qwen3-0.6B+Qwen3-8B",
+    "router_path": "/remote-home/pxl/.cache/huggingface/hub/models--GY2233--Qwen3_0_6B_Qwen3_8B/snapshots/5054687f5ad94d0a092e73e4219258fb1fe7abdf",
+    "switching_strategy": "entropy_drift",
+    "alpha": 0.1,
+    "bias": 0.0,
+    "tau": 0.5,
+    "warmup_steps": 10,
+    "random_seed": 42,
+    "override_init_args": {
+      "pretrained_model_name": "/remote-home/pxl/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca"
+    }
+  }
+}

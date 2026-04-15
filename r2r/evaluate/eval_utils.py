@@ -242,7 +242,15 @@ def lcb_codegeneration_prompt_fn(line):
     
     return query, inputs, outputs
 
-def translate_private_test_cases(encoded_data: str) -> dict[str, str]:
+def translate_private_test_cases(encoded_data):
+    """Decode LCB private tests: `code_generation` Hub parquet uses a JSON array string; older lite builds used base64+zlib+pickle."""
+    if isinstance(encoded_data, list):
+        return encoded_data
+    if not isinstance(encoded_data, str):
+        encoded_data = str(encoded_data)
+    s = encoded_data.strip()
+    if s.startswith("["):
+        return json.loads(s)
     decoded_data = base64.b64decode(encoded_data)
     decompressed_data = zlib.decompress(decoded_data)
     original_data = pickle.loads(decompressed_data)

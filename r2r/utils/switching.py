@@ -28,6 +28,14 @@ class SwitchingState:
     critical_history: List[float] = None
     momentum: float = 0.0
 
+
+@dataclass
+class EntropyDriftSequenceState:
+    ema_mean: float = 0.0
+    n_seen: int = 0
+    last_model: str = "quick"
+    hold_remaining: int = 0
+
 class ModelSwitchingStrategy:
     """Base class for model switching strategies"""
     requires_reference_evaluation = False
@@ -181,6 +189,166 @@ class EntropySwitching(ModelSwitchingStrategy):
         self.state.last_model = "reference" if model_choices.any().item() else "quick"
         return model_choices
 
+
+class EntropyDriftSwitching(ModelSwitchingStrategy):
+    """Switch based on entropy drift from a running per-sequence baseline.
+
+    This router tracks an EMA per sequence, resets state when a new sample
+    starts, and can apply hysteresis / minimum-hold logic to reduce token-level
+    flicker. A confidence filter can further block wasteful escalations when
+    the quick model is already highly certain.
+    """
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        alpha: float = 0.1,
+        bias: float = 0.0,
+        tau: float = 0.5,
+        warmup_steps: int = 10,
+        random_seed: Optional[int] = 42,
+        hysteresis: float = 0.0,
+        hold_tokens: int = 0,
+        max_confident_prob: Optional[float] = None,
+        min_entropy: Optional[float] = None,
+        stochastic: bool = True,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.bias = float(bias)
+        self.tau = float(tau)
+        self.warmup_steps = int(warmup_steps)
+        self.hysteresis = float(hysteresis)
+        self.hold_tokens = max(0, int(hold_tokens))
+        self.max_confident_prob = (
+            float(max_confident_prob) if max_confident_prob is not None else None
+        )
+        self.min_entropy = float(min_entropy) if min_entropy is not None else None
+        self.stochastic = bool(stochastic)
+        self.threshold = self.bias
+        self._rng = random.Random(random_seed)
+
+        self._ema_mean: float = 0.0
+        self._n_seen: int = 0
+        self._sequence_states = {}
+        self._global_sequence_key = "__entropy_drift_global__"
+
+        print(
+            f"EntropyDriftSwitching: alpha={self.alpha}, bias={self.bias}, "
+            f"tau={self.tau}, warmup={self.warmup_steps}, hysteresis={self.hysteresis}, "
+            f"hold_tokens={self.hold_tokens}, max_confident_prob={self.max_confident_prob}, "
+            f"min_entropy={self.min_entropy}, stochastic={self.stochastic}, seed={random_seed}"
+        )
+
+    def reset(self):
+        self._sequence_states.clear()
+        self._ema_mean = 0.0
+        self._n_seen = 0
+        self.state.last_model = "quick"
+
+    def _resolve_sequence_key(self, outputs, index: int):
+        sequence_ids = getattr(outputs, "sequence_ids", None)
+        if sequence_ids is None or index >= len(sequence_ids):
+            return self._global_sequence_key
+        sequence_id = sequence_ids[index]
+        return sequence_id if sequence_id is not None else self._global_sequence_key
+
+    def _resolve_position(self, outputs, index: int) -> Optional[int]:
+        positions = getattr(outputs, "positions", None)
+        if positions is None or index >= len(positions):
+            return None
+        position = positions[index]
+        return int(position) if position is not None else None
+
+    def _get_sequence_state(self, key, position: Optional[int]) -> EntropyDriftSequenceState:
+        if position == 0 or key not in self._sequence_states:
+            self._sequence_states[key] = EntropyDriftSequenceState()
+        return self._sequence_states[key]
+
+    def _passes_secondary_filter(self, logits_row: torch.Tensor, entropy_value: float) -> bool:
+        if self.min_entropy is not None and entropy_value < self.min_entropy:
+            return False
+        if self.max_confident_prob is not None:
+            top1_prob = float(torch.softmax(logits_row, dim=-1).max().item())
+            if top1_prob > self.max_confident_prob:
+                return False
+        return True
+
+    def _compute_switch_probability(self, drift: float) -> float:
+        return 1.0 / (1.0 + np.exp(-(drift - self.bias) / max(self.tau, 1e-8)))
+
+    def _update_state_ema(self, state: EntropyDriftSequenceState, entropy_value: float):
+        if state.n_seen == 0:
+            state.ema_mean = entropy_value
+        else:
+            state.ema_mean = self.alpha * entropy_value + (1.0 - self.alpha) * state.ema_mean
+        state.n_seen += 1
+        self._ema_mean = state.ema_mean
+        self._n_seen = state.n_seen
+
+    def route(self, outputs) -> torch.Tensor:
+        batch_size = outputs.logits.shape[0]
+        next_token_logits = outputs.logits[:, -1, :]
+        model_choices = torch.zeros(batch_size, dtype=torch.int, device=next_token_logits.device)
+
+        entropy_values = compute_entropy(next_token_logits)
+        drift_values = torch.zeros(batch_size, dtype=torch.float32)
+
+        for i in range(batch_size):
+            h_t = float(entropy_values[i].item())
+            sequence_key = self._resolve_sequence_key(outputs, i)
+            position = self._resolve_position(outputs, i)
+            state = self._get_sequence_state(sequence_key, position)
+            logits_row = next_token_logits[i]
+
+            if state.n_seen < self.warmup_steps:
+                # Warmup: always stay on SLM, just accumulate EMA
+                drift_values[i] = 0.0
+                model_choices[i] = 0
+            else:
+                drift = h_t - state.ema_mean
+                drift_values[i] = drift
+                passes_filter = self._passes_secondary_filter(logits_row, h_t)
+                enter_threshold = self.bias
+                exit_threshold = self.bias - self.hysteresis
+
+                if self.stochastic:
+                    should_sample = passes_filter and drift >= exit_threshold
+                    switch_prob = self._compute_switch_probability(drift) if should_sample else 0.0
+                    if state.last_model == "reference" and passes_filter and drift >= exit_threshold:
+                        choose_reference = True
+                    else:
+                        choose_reference = should_sample and (self._rng.random() < switch_prob)
+                else:
+                    if state.last_model == "reference":
+                        choose_reference = passes_filter and (
+                            state.hold_remaining > 0 or drift >= exit_threshold
+                        )
+                    else:
+                        choose_reference = passes_filter and (drift >= enter_threshold)
+
+                model_choices[i] = 1 if choose_reference else 0
+
+            if int(model_choices[i].item()) == 1:
+                if state.last_model != "reference":
+                    state.hold_remaining = self.hold_tokens
+                elif state.hold_remaining > 0:
+                    state.hold_remaining -= 1
+                state.last_model = "reference"
+            else:
+                state.hold_remaining = 0
+                state.last_model = "quick"
+
+            self._update_state_ema(state, h_t)
+
+        self.last_route_scores = drift_values.detach().cpu()
+        self.last_route_metric_name = "entropy_drift"
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+
 class EntropyTopKSwitching(ModelSwitchingStrategy):
 
     def __init__(
@@ -218,6 +386,174 @@ class EntropyTopKSwitching(ModelSwitchingStrategy):
 
         self.state.last_model = "reference" if model_choices.any().item() else "quick"
         return model_choices
+
+class JSSwitching(ModelSwitchingStrategy):
+    """Route every token to reference evaluation and decide with full-vocab JS."""
+
+    requires_reference_evaluation = True
+    requires_reference_logits = True
+    reference_distribution_mode = "full"
+    trace_router_score_from_js = True
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        js_threshold: Optional[float] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.js_threshold = float(js_threshold) if js_threshold is not None else 0.2
+        print(f"Using js threshold: {self.js_threshold}")
+
+    def get_reference_candidates(self, outputs: ModelOutputs) -> torch.Tensor:
+        batch_size = outputs.logits.shape[0]
+        self.last_route_scores = None
+        self.last_route_metric_name = "js"
+        return torch.ones(batch_size, dtype=torch.int, device=outputs.logits.device)
+
+    def route_with_reference_logits(
+        self, quick_logits: torch.Tensor, reference_logits: torch.Tensor
+    ) -> torch.Tensor:
+        js_divergence = compute_js_divergence(quick_logits, reference_logits)
+        self.last_route_scores = js_divergence.detach().cpu()
+        self.last_route_metric_name = "js"
+        return (js_divergence >= self.js_threshold).to(torch.int)
+
+    def route(self, outputs: ModelOutputs) -> torch.Tensor:
+        if outputs.reference_logits is None:
+            raise ValueError(
+                "JSSwitching.route requires outputs.reference_logits for final routing"
+            )
+
+        quick_logits = outputs.logits[:, -1, :]
+        reference_logits = outputs.reference_logits[:, -1, :]
+        model_choices = self.route_with_reference_logits(
+            quick_logits, reference_logits
+        ).to(device=quick_logits.device, dtype=torch.int)
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+class JSLLMSwitching(JSSwitching):
+    """Route every token to LLM-side full-vocab JS final decision."""
+
+    reference_decision_mode = "llm_full_js"
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        js_threshold: Optional[float] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model_path=model_path,
+            js_threshold=js_threshold,
+            device=device,
+            dtype=dtype,
+            override_init_args=override_init_args,
+            **kwargs,
+        )
+        print("Using js_llm with LLM-side full-vocab JS final decision")
+
+class JSTopKSparseSwitching(JSSwitching):
+    """Route every token using sparse top-k JS divergence."""
+
+    requires_reference_logits = False
+    reference_distribution_mode = "topk"
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        js_threshold: Optional[float] = None,
+        js_topk: Optional[int] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model_path=model_path,
+            js_threshold=js_threshold,
+            device=device,
+            dtype=dtype,
+            override_init_args=override_init_args,
+            **kwargs,
+        )
+        self.reference_topk_k = int(js_topk) if js_topk is not None else 64
+        print(f"Using js_topk_sparse threshold: {self.js_threshold}, top-k: {self.reference_topk_k}")
+
+    def route_with_reference_topk(
+        self,
+        quick_topk_indices: torch.Tensor,
+        quick_topk_logits: torch.Tensor,
+        reference_topk_indices: torch.Tensor,
+        reference_topk_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        js_divergence = compute_sparse_topk_js_divergence(
+            logits_p=quick_topk_logits,
+            indices_p=quick_topk_indices,
+            logits_q=reference_topk_logits,
+            indices_q=reference_topk_indices,
+        )
+        self.last_route_scores = js_divergence.detach().cpu()
+        self.last_route_metric_name = "js"
+        return (js_divergence >= self.js_threshold).to(torch.int)
+
+    def extract_quick_topk(
+        self, quick_logits: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        quick_topk_logits, quick_topk_indices = extract_topk_logits(
+            quick_logits, self.reference_topk_k
+        )
+        return quick_topk_indices, quick_topk_logits
+
+    def route(self, outputs: ModelOutputs) -> torch.Tensor:
+        if outputs.reference_topk_indices is None or outputs.reference_topk_logits is None:
+            raise ValueError(
+                "JSTopKSparseSwitching.route requires sparse reference top-k outputs"
+            )
+
+        quick_logits = outputs.logits[:, -1, :]
+        quick_topk_indices, quick_topk_logits = self.extract_quick_topk(quick_logits)
+        model_choices = self.route_with_reference_topk(
+            quick_topk_indices=quick_topk_indices,
+            quick_topk_logits=quick_topk_logits,
+            reference_topk_indices=outputs.reference_topk_indices,
+            reference_topk_logits=outputs.reference_topk_logits,
+        ).to(device=quick_logits.device, dtype=torch.int)
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+class JSTopKLLMSwitching(JSTopKSparseSwitching):
+    """Route every token to LLM-side sparse top-k JS final decision."""
+
+    reference_decision_mode = "llm_sparse_js"
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        js_threshold: Optional[float] = None,
+        js_topk: Optional[int] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            model_path=model_path,
+            js_threshold=js_threshold,
+            js_topk=js_topk,
+            device=device,
+            dtype=dtype,
+            override_init_args=override_init_args,
+            **kwargs,
+        )
+        print("Using js_topk_llm with LLM-side sparse top-k JS final decision")
 
 class EntropyJSSwitching(ModelSwitchingStrategy):
     """Route high-entropy tokens to reference evaluation, then decide with JS divergence."""
@@ -1130,7 +1466,12 @@ def create_switching_strategy(strategy_name: str, **kwargs) -> ModelSwitchingStr
     strategies = {
         'immediate': ImmediateSwitching,
         'entropy': EntropySwitching,
+        'entropy_drift': EntropyDriftSwitching,
         'entropy_topk': EntropyTopKSwitching,
+        'js': JSSwitching,
+        'js_llm': JSLLMSwitching,
+        'js_topk_sparse': JSTopKSparseSwitching,
+        'js_topk_llm': JSTopKLLMSwitching,
         'entropy_js': EntropyJSSwitching,
         'entropy_js_llm': EntropyJSLLMSwitching,
         'entropy_js_topk_sparse': EntropyJSTopKSparseSwitching,

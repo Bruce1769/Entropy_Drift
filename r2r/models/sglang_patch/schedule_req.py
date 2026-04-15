@@ -28,13 +28,18 @@ class WaitingReq:
         reference_topk_k: Optional[int] = None,
         reference_decision_mode: Optional[str] = None,
         reference_js_threshold: Optional[float] = None,
+        reference_token_id: Optional[int] = None,
         reference_topk_indices=None,
         reference_topk_logits=None,
+        reference_entropy: Optional[float] = None,
+        reference_top1_prob: Optional[float] = None,
         quick_logits=None,
         quick_token_id: Optional[int] = None,
         quick_topk_indices=None,
         quick_topk_logits=None,
+        js_divergence: Optional[float] = None,
         final_token_source: Optional[str] = None,
+        use_reference_output: bool = True,
         async_speculative: bool = False,
     ):
         self.rid = rid
@@ -46,11 +51,16 @@ class WaitingReq:
         self.reference_topk_k = reference_topk_k
         self.reference_decision_mode = reference_decision_mode
         self.reference_js_threshold = reference_js_threshold
+        self.reference_token_id = reference_token_id
         self.reference_topk_indices = reference_topk_indices
         self.reference_topk_logits = reference_topk_logits
+        self.reference_entropy = reference_entropy
+        self.reference_top1_prob = reference_top1_prob
         self.quick_logits = quick_logits
         self.quick_token_id = quick_token_id
         self.quick_topk_indices = quick_topk_indices
         self.quick_topk_logits = quick_topk_logits
+        self.js_divergence = js_divergence
         self.final_token_source = final_token_source
+        self.use_reference_output = use_reference_output
         self.async_speculative = async_speculative

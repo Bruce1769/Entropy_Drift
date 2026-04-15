@@ -57,6 +57,16 @@
         "options_fields": ["Correct Answer", "Incorrect Answer 1", "Incorrect Answer 2", "Incorrect Answer 3"],
         "description": "Graduate-level multiple-choice questions across various domains"
     },
+    "gpqa_diamond_open": {
+        "name": "GPQA Diamond (hendrydong mirror, boxed answers — no Hub gate)",
+        "path": "hendrydong/gpqa_diamond",
+        "answer_type": "boxed",
+        "id_field": "Record ID",
+        "question_field": "problem",
+        "answer_field": "solution",
+        "prompt_template": "",
+        "description": "Same Diamond items as GPQA in open QA+boxed format; use dataset gpqa + HF token for official MC eval"
+    },
     "mmlu-pro":{
         "name": "MMLU-Pro",
         "path": "TIGER-Lab/MMLU-Pro",
@@ -108,6 +118,32 @@
         "description": "Original MMLU college_mathematics subject",
         "selected_subjects": "college_mathematics"
     },
+    "mmlu_chemistry": {
+        "name": "MMLU Chemistry",
+        "path": "cais/mmlu",
+        "dataset_config": "all",
+        "answer_type": "mmlu-multiple-choice",
+        "id_field": "question_id",
+        "question_field": "question",
+        "answer_field": "answer",
+        "prompt_template": "",
+        "options_fields": "choices",
+        "description": "MMLU high_school_chemistry and college_chemistry",
+        "selected_subjects": "high_school_chemistry,college_chemistry"
+    },
+    "mmlu_biology": {
+        "name": "MMLU Biology",
+        "path": "cais/mmlu",
+        "dataset_config": "all",
+        "answer_type": "mmlu-multiple-choice",
+        "id_field": "question_id",
+        "question_field": "question",
+        "answer_field": "answer",
+        "prompt_template": "",
+        "options_fields": "choices",
+        "description": "MMLU high_school_biology and college_biology",
+        "selected_subjects": "high_school_biology,college_biology"
+    },
     "aime25": {
         "name": "AIME Mathematical Problems",
         "path": "yentinglin/aime_2025",
@@ -130,14 +166,14 @@
     },
     "livecodebench": {
         "name": "LiveCodeBench",
-        "path": "livecodebench/code_generation_lite",
-        "dataset_config": "v4_v5",
+        "path": "livecodebench/code_generation",
+        "dataset_config": "default",
         "answer_type": "livecodebench",
         "id_field": "question_id",
         "question_field": "question_content",
         "answer_field": "public_test_cases",
         "prompt_template": "{question}",
-        "description": "LiveCodeBench dataset"
+        "description": "LiveCodeBench code_generation test split (parquet; datasets>=3.x). Older code_generation_lite+v4_v5 scripts are not supported by the datasets library."
     },
     "mmlu-pro_strange":{
         "name": "MMLU-Pro",
