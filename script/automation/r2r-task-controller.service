@@ -1,0 +1,21 @@
+[Unit]
+Description=R2R Experiment Task Controller
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pxl
+WorkingDirectory=/remote-home/pxl/R2R
+Environment=PYTHON_BIN=/remote-home/pxl/miniconda3/envs/r2r/bin/python
+Environment=CONFIG_PATH=/remote-home/pxl/R2R/resource/aime26_task_controller_config.json
+ExecStart=/bin/bash /remote-home/pxl/R2R/script/automation/run_task_controller_foreground.sh
+ExecStop=/bin/bash /remote-home/pxl/R2R/script/automation/stop_task_controller.sh
+Restart=always
+RestartSec=30
+TimeoutStopSec=90
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

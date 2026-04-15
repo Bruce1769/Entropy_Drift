@@ -1,0 +1,42 @@
+{
+  "special_tokens": {
+    "think_start": 151667,
+    "think_end": 151668
+  },
+  "quick": {
+    "model_name": "Qwen3-14B",
+    "model_path": "Qwen/Qwen3-14B",
+    "param": "14",
+    "mem_fraction_static": 0.85
+  },
+  "reference": {
+    "model_name": "Qwen3-14B",
+    "model_path": "Qwen/Qwen3-14B",
+    "param": "14",
+    "mem_fraction_static": 0.85
+  },
+  "continuation_main": {
+    "model_name": "Qwen3-14B",
+    "model_path": "Qwen/Qwen3-14B",
+    "param": "14",
+    "tp_size": 1,
+    "base_gpu_id": 0,
+    "mem_fraction_static": 0.90
+  },
+  "continuation_reference": {
+    "model_name": "Qwen3-14B",
+    "model_path": "Qwen/Qwen3-14B",
+    "param": "14",
+    "tp_size": 1,
+    "base_gpu_id": 0,
+    "mem_fraction_static": 0.90
+  },
+  "verify": {
+    "model_name": "Qwen2.5-72B-Instruct",
+    "model_path": "Qwen/Qwen2.5-72B-Instruct",
+    "mem_fraction_static": 0.90,
+    "max_new_tokens": 16,
+    "base_gpu_id": 0,
+    "tp_size": 4
+  }
+}

@@ -27,6 +27,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8192}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
+RANDOM_SEED="${RANDOM_SEED:-42}"
 RESUME="${RESUME:-1}"
 SKIP_PROBLEM_IDS="${SKIP_PROBLEM_IDS:-}"
 RERUN_MISSING_ANSWERS="${RERUN_MISSING_ANSWERS:-1}"
@@ -50,6 +51,7 @@ build_cmd() {
     --temperature "$TEMPERATURE"
     --top_p "$TOP_P"
     --top_k "$TOP_K"
+    --random_seed "$RANDOM_SEED"
     --output_dir "$OUTPUT_DIR"
   )
 
@@ -136,6 +138,7 @@ echo "  RESUME=$RESUME"
 echo "  SKIP_PROBLEM_IDS=${SKIP_PROBLEM_IDS:-<none>}"
 echo "  RERUN_MISSING_ANSWERS=$RERUN_MISSING_ANSWERS"
 echo "  RERUN_MAX_NEW_TOKENS=$RERUN_MAX_NEW_TOKENS"
+echo "  RANDOM_SEED=$RANDOM_SEED"
 echo
 printf 'Command:'
 printf ' %q' "${cmd[@]}"
