@@ -1154,6 +1154,72 @@ class NeuralSwitching(ModelSwitchingStrategy):
             return model_choices
 
 
+class EntropyNeuralSwitching(ModelSwitchingStrategy):
+    """Two-stage hybrid routing on the quick model's last-token distribution.
+
+    1) **Entropy gate (same semantics as ``EntropySwitching``)**:
+       if normalized entropy >= ``entropy_threshold`` → route to the reference (LLM).
+    2) **Otherwise** run the **neural router** (same as ``NeuralSwitching``):
+       if neural critical probability >= neural ``threshold`` → LLM, else stay on SLM.
+
+    Low-entropy positions defer to the trained classifier instead of staying on SLM
+    unconditionally.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        entropy_threshold: Optional[float] = None,
+        threshold: Optional[float] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        use_cuda_graph: bool = True,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.entropy_threshold = (
+            float(entropy_threshold) if entropy_threshold is not None else 0.45
+        )
+        self.neural = NeuralSwitching(
+            model_path=model_path,
+            threshold=threshold,
+            device=device,
+            dtype=dtype,
+            use_cuda_graph=use_cuda_graph,
+            override_init_args=override_init_args,
+        )
+        print(
+            f"EntropyNeuralSwitching: entropy_threshold={self.entropy_threshold} "
+            f"(entropy >= → LLM), else neural threshold={self.neural.threshold}"
+        )
+
+    def route(self, outputs: ModelOutputs) -> torch.Tensor:
+        batch_size = outputs.logits.shape[0]
+        next_token_logits = outputs.logits[:, -1, :]
+        entropy_values = compute_entropy(next_token_logits)
+        self.last_route_scores = entropy_values.detach().cpu()
+        self.last_route_metric_name = "entropy_then_neural_entropy"
+
+        high_entropy = entropy_values >= self.entropy_threshold
+        if bool(high_entropy.all().item()):
+            model_choices = torch.ones(
+                batch_size, dtype=torch.int, device=next_token_logits.device
+            )
+        elif bool((~high_entropy).all().item()):
+            model_choices = self.neural.route(outputs)
+        else:
+            neural_choices = self.neural.route(outputs)
+            model_choices = torch.where(
+                high_entropy,
+                torch.ones_like(neural_choices),
+                neural_choices,
+            )
+
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+
 class NeuralRollingWindowSwitching(ModelSwitchingStrategy):
     """Neural network-based switching using a trained critical case classifier with rolling window"""
 
@@ -1466,6 +1532,7 @@ def create_switching_strategy(strategy_name: str, **kwargs) -> ModelSwitchingStr
     strategies = {
         'immediate': ImmediateSwitching,
         'entropy': EntropySwitching,
+        'entropy_neural': EntropyNeuralSwitching,
         'entropy_drift': EntropyDriftSwitching,
         'entropy_topk': EntropyTopKSwitching,
         'js': JSSwitching,

@@ -88,6 +88,8 @@ R2R_CONFIGS = load_r2r_configs()
 # CLI/config aliases for switching strategy names (canonical keys use underscores).
 _SWITCHING_STRATEGY_ALIASES = {
     "entropydrift": "entropy_drift",
+    "entropy_then_neural": "entropy_neural",
+    "entropytechneural": "entropy_neural",
 }
 
 
@@ -195,7 +197,8 @@ def parse_args():
     
     # Hybrid model configuration
     parser.add_argument('--switching_strategy', type=str, default=None,
-                      help='Switching strategy for hybrid model (default: loaded from config, or "neural")')
+                      help='Switching strategy for hybrid model (default: from config or neural). '
+                           'Includes entropy_neural: entropy gate then neural router.')
     parser.add_argument('--is_record', action='store_true',
                       help='Record hybrid model generation')
     parser.add_argument('--trace_reference_topk_k', type=int, default=64,
@@ -484,6 +487,18 @@ def process_with_model(
                 'model_path': router_path,
                 'entropy_threshold': router_config.get("entropy_threshold", args.threshold)
             })
+        elif switching_strategy == 'entropy_neural':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'entropy_threshold': router_config.get("entropy_threshold", 0.45),
+            })
+            neural_threshold = router_config.get("threshold")
+            if neural_threshold is None:
+                neural_threshold = args.threshold
+            if neural_threshold is not None:
+                strategy_kwargs["threshold"] = neural_threshold
+            if args.is_record:
+                strategy_kwargs["use_cuda_graph"] = False
         elif switching_strategy == 'entropy_drift':
             strategy_kwargs.update({
                 'model_path': router_path,

@@ -70,6 +70,20 @@ def load_r2r_configs() -> Dict:
 DATASET_CONFIGS, MODELS = load_configs()
 R2R_CONFIGS = load_r2r_configs()
 
+_SERVER_SWITCHING_STRATEGY_ALIASES = {
+    "entropydrift": "entropy_drift",
+    "entropy_then_neural": "entropy_neural",
+    "entropytechneural": "entropy_neural",
+}
+
+
+def normalize_switching_strategy_name(name: Optional[str]) -> Optional[str]:
+    if name is None:
+        return None
+    key = str(name).strip().lower().replace("-", "_")
+    return _SERVER_SWITCHING_STRATEGY_ALIASES.get(key, name)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Evaluate models on different datasets')
     
@@ -349,6 +363,7 @@ def process_with_model(
             switching_strategy = args.switching_strategy
         if switching_strategy is None:
             switching_strategy = "neural"
+        switching_strategy = normalize_switching_strategy_name(switching_strategy)
         
         # Determine router path from config
         router_path = router_config.get("router_path")
@@ -398,6 +413,16 @@ def process_with_model(
                 'model_path': router_path,
                 'entropy_threshold': router_config.get("entropy_threshold", args.threshold)
             })
+        elif switching_strategy == 'entropy_neural':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'entropy_threshold': router_config.get("entropy_threshold", 0.45),
+            })
+            neural_threshold = router_config.get("threshold")
+            if neural_threshold is None:
+                neural_threshold = args.threshold
+            if neural_threshold is not None:
+                strategy_kwargs["threshold"] = neural_threshold
         elif switching_strategy == 'js':
             strategy_kwargs.update({
                 'model_path': router_path,
