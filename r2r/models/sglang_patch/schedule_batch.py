@@ -353,6 +353,11 @@ def init_next_round_input(
             ) = tree_cache.match_prefix(
                 key=self.adjust_max_prefix_ids(),
             )
+            # RadixCache always returns a node; ChunkCache returns None. For caches with a
+            # root, use it so cache_finished_req's dec_lock_ref never sees None (no-op on root).
+            if self.last_node is None and hasattr(tree_cache, "root_node"):
+                self.last_node = tree_cache.root_node
+                self.last_host_node = tree_cache.root_node
     if self.last_cached_loc is not None:
         self.prefix_indices = torch.tensor(self.last_cached_loc, device=self.device)
     self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)

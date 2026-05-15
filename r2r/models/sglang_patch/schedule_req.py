@@ -1,5 +1,78 @@
 from typing import Optional, Tuple, Union, List, Dict
+from dataclasses import dataclass
 from sglang.srt.sampling.sampling_params import SamplingParams
+
+
+@dataclass
+class EntropyLookaheadRpc:
+    """SLM -> LLM: score token log p_LLM(token_k | context_k) for each pair."""
+
+    query_id: int
+    contexts: List[List[int]]
+    tokens: List[int]
+
+
+@dataclass
+class EntropyLookaheadResp:
+    query_id: int
+    logprobs: List[float]
+    ok: bool = True
+    error: Optional[str] = None
+
+
+@dataclass
+class SlidingWindowJsRpc:
+    """SLM -> LLM: next-token logits at each sliding window position.
+
+    The LLM runs one short forward per position j on prefix full_ids[: base_len + L - n + j]
+    (SGLang prefill only returns logits at the last token, not a full [seq_len, vocab] matrix).
+    """
+
+    query_id: int
+    full_ids: List[int]
+    base_len: int
+    window_size: int
+
+
+@dataclass
+class SlidingWindowJsResp:
+    query_id: int
+    llm_logits: List  # list of numpy.ndarray or torch.Tensor, shape [vocab] each
+    ok: bool = True
+    error: Optional[str] = None
+
+
+@dataclass
+class NextTokenJsRpc:
+    """SLM -> LLM: next-token logits p_LLM(· | context_ids) (one short forward).
+
+    When ``rid`` is set, KV is kept for a follow-up ``WaitingReq`` with status
+    ``EVJS_CONTINUE`` (same rid) so the formal LLM step does not prefill again.
+    """
+
+    query_id: int
+    context_ids: List[int]
+    rid: Optional[str] = None
+
+
+@dataclass
+class NextTokenJsAbortRpc:
+    """Release KV from a prior fused NextTokenJsRpc(rid=...) when JS gate fails."""
+
+    rid: str
+
+
+@dataclass
+class NextTokenJsResp:
+    query_id: int
+    llm_logits: Optional[object] = None  # backward-compat: full logits [vocab]
+    llm_topk_indices: Optional[List[int]] = None  # compact payload for EVJS
+    llm_topk_probs: Optional[List[float]] = None  # compact payload for EVJS
+    llm_tail_mass: Optional[float] = None  # compact payload for EVJS
+    topk: Optional[int] = None
+    ok: bool = True
+    error: Optional[str] = None
+
 
 class SimpleSamplingParams:
     def __init__(self, temperature: float = 1.0, top_k: int = -1, top_p: float = 1.0, max_new_tokens: int = 128):
@@ -23,44 +96,9 @@ class WaitingReq:
         new_token_ids: List[int],
         sampling_params: Optional[SimpleSamplingParams] = None,
         status: str = "need",
-        reference_logits=None,
-        reference_logits_mode: Optional[str] = None,
-        reference_topk_k: Optional[int] = None,
-        reference_decision_mode: Optional[str] = None,
-        reference_js_threshold: Optional[float] = None,
-        reference_token_id: Optional[int] = None,
-        reference_topk_indices=None,
-        reference_topk_logits=None,
-        reference_entropy: Optional[float] = None,
-        reference_top1_prob: Optional[float] = None,
-        quick_logits=None,
-        quick_token_id: Optional[int] = None,
-        quick_topk_indices=None,
-        quick_topk_logits=None,
-        js_divergence: Optional[float] = None,
-        final_token_source: Optional[str] = None,
-        use_reference_output: bool = True,
-        async_speculative: bool = False,
     ):
         self.rid = rid
         self.new_token_ids = new_token_ids
         self.sampling_params = sampling_params
         self.status = status
-        self.reference_logits = reference_logits
-        self.reference_logits_mode = reference_logits_mode
-        self.reference_topk_k = reference_topk_k
-        self.reference_decision_mode = reference_decision_mode
-        self.reference_js_threshold = reference_js_threshold
-        self.reference_token_id = reference_token_id
-        self.reference_topk_indices = reference_topk_indices
-        self.reference_topk_logits = reference_topk_logits
-        self.reference_entropy = reference_entropy
-        self.reference_top1_prob = reference_top1_prob
-        self.quick_logits = quick_logits
-        self.quick_token_id = quick_token_id
-        self.quick_topk_indices = quick_topk_indices
-        self.quick_topk_logits = quick_topk_logits
-        self.js_divergence = js_divergence
-        self.final_token_source = final_token_source
-        self.use_reference_output = use_reference_output
-        self.async_speculative = async_speculative
+

@@ -3,14 +3,18 @@ from typing import List, Optional
 import numpy as np
 from collections import deque
 from dataclasses import dataclass
+import json
 import os
 import sys
 import random
+import threading
+import time
 from tqdm import tqdm
 
 from r2r.utils.metrics import (
     compute_logu,
     compute_entropy,
+    compute_variance,
     compute_topk_entropy,
     compute_js_divergence,
     compute_sparse_topk_js_divergence,
@@ -18,6 +22,24 @@ from r2r.utils.metrics import (
 )
 from r2r.models.router import load_model
 from r2r.utils.dataclass import ModelOutputs
+
+_entropy_lookahead_score_log_lock = threading.Lock()
+
+
+def append_entropy_lookahead_score_log(path: Optional[str], record: dict) -> None:
+    """Append one JSON line per triggered entropy-lookahead judgment (thread-safe)."""
+    if not path:
+        return
+    record.setdefault("ts", time.time())
+    try:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with _entropy_lookahead_score_log_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"[EntropyLookahead] score log write failed ({path}): {e}")
 
 @dataclass
 class SwitchingState:
@@ -35,6 +57,17 @@ class EntropyDriftSequenceState:
     n_seen: int = 0
     last_model: str = "quick"
     hold_remaining: int = 0
+
+def _leftmost_argmax_index(vals: list) -> int:
+    """Index of the maximum element; ties broken toward the smallest index."""
+    if not vals:
+        return 0
+    m = max(vals)
+    for i, v in enumerate(vals):
+        if v == m:
+            return i
+    return 0
+
 
 class ModelSwitchingStrategy:
     """Base class for model switching strategies"""
@@ -82,6 +115,174 @@ class ModelSwitchingStrategy:
                 else None
             ),
         }
+
+
+class EntropyVarianceJsSwitching(ModelSwitchingStrategy):
+    """Entropy gate then JS vs LLM (RPC path in SLMServer). Without RPC: entropy-only routing."""
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        entropy_threshold: Optional[float] = None,
+        variance_threshold: Optional[float] = None,
+        js_threshold: Optional[float] = None,
+        rpc_timeout_s: float = 120.0,
+        score_log_path: Optional[str] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        _ = (
+            model_path,
+            variance_threshold,
+            device,
+            dtype,
+            override_init_args,
+            kwargs,
+        )
+        self.entropy_threshold = float(entropy_threshold) if entropy_threshold is not None else 0.45
+        self.js_threshold = float(js_threshold) if js_threshold is not None else 0.1
+        self.rpc_timeout_s = float(rpc_timeout_s)
+        self.score_log_path = score_log_path
+        print(
+            f"EntropyVarianceJsSwitching: entropy_threshold={self.entropy_threshold}, "
+            f"js_threshold={self.js_threshold}, rpc_timeout_s={self.rpc_timeout_s}"
+            + (f", score_log_path={self.score_log_path}" if self.score_log_path else "")
+        )
+
+    def route(self, outputs: ModelOutputs) -> torch.Tensor:
+        batch_size = outputs.logits.shape[0]
+        next_token_logits = outputs.logits[:, -1, :]
+        entropy = compute_entropy(next_token_logits)
+        if isinstance(entropy, float):
+            entropy = torch.tensor([entropy], device=next_token_logits.device)
+        model_choices = (entropy > self.entropy_threshold).to(torch.int)
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+
+class EntropyLookaheadSwitching(ModelSwitchingStrategy):
+    """Entropy-lookahead routing (full logic in SLMServer)."""
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        entropy_threshold: Optional[float] = None,
+        lookahead_steps: int = 3,
+        score_threshold: float = 2.0,
+        rpc_timeout_s: float = 120.0,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        score_log_path: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.entropy_threshold = float(entropy_threshold) if entropy_threshold is not None else 0.45
+        self.lookahead_steps = int(lookahead_steps)
+        self.score_threshold = float(score_threshold)
+        self.rpc_timeout_s = float(rpc_timeout_s)
+        self.score_log_path = score_log_path
+        print(
+            f"EntropyLookaheadSwitching: entropy_threshold={self.entropy_threshold}, "
+            f"lookahead_steps={self.lookahead_steps}, score_threshold={self.score_threshold}"
+            + (f", score_log_path={self.score_log_path}" if self.score_log_path else "")
+        )
+
+    def route(self, outputs: ModelOutputs) -> torch.Tensor:
+        batch_size = outputs.logits.shape[0]
+        next_token_logits = outputs.logits[:, -1, :]
+        model_choices = torch.zeros(batch_size, dtype=torch.int, device=next_token_logits.device)
+        for i in range(batch_size):
+            entropy = compute_entropy(next_token_logits[i : i + 1])
+            model_choices[i] = 0 if entropy < self.entropy_threshold else 1
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+
+class SlidingWindowEntropySwitching(ModelSwitchingStrategy):
+    """Sliding-window mean entropy (stateful logic in SLMServer)."""
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        window_size: int = 5,
+        entropy_sum_threshold: float = 10.0,
+        entropy_mean_threshold: Optional[float] = None,
+        intervention_mode: str = "replace_first",
+        truncate_on_llm_trigger: bool = False,
+        rpc_timeout_s: float = 120.0,
+        device: str = "cuda",
+        dtype=torch.float32,
+        override_init_args: Optional[dict] = None,
+        score_log_path: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        _ = kwargs
+        self.window_size = max(1, int(window_size))
+        self.entropy_sum_threshold = float(entropy_sum_threshold)
+        if entropy_mean_threshold is not None:
+            self.entropy_mean_threshold = float(entropy_mean_threshold)
+        else:
+            self.entropy_mean_threshold = float(entropy_sum_threshold) / float(self.window_size)
+        mode = str(intervention_mode).lower()
+        aliases = {
+            "1": "replace_first",
+            "first": "replace_first",
+            "replace_first": "replace_first",
+            "2": "replace_window",
+            "window": "replace_window",
+            "replace_window": "replace_window",
+            "3": "replace_full_window",
+            "full_window": "replace_full_window",
+            "replace_full_window": "replace_full_window",
+        }
+        if mode not in aliases:
+            raise ValueError(
+                "intervention_mode must be one of "
+                "['replace_first', 'replace_window', 'replace_full_window', '1', '2', '3']"
+            )
+        self.intervention_mode = aliases[mode]
+        self.truncate_on_llm_trigger = bool(truncate_on_llm_trigger)
+        self.rpc_timeout_s = float(rpc_timeout_s)
+        self.score_log_path = score_log_path
+        print(
+            "SlidingWindowEntropySwitching: "
+            f"window_size={self.window_size}, "
+            f"entropy_mean_threshold={self.entropy_mean_threshold} "
+            f"(YAML sum field={self.entropy_sum_threshold}), "
+            f"intervention_mode={self.intervention_mode}, "
+            f"truncate_on_llm_trigger={self.truncate_on_llm_trigger}"
+            + (f", score_log_path={self.score_log_path}" if self.score_log_path else "")
+        )
+
+    def route(self, outputs: ModelOutputs) -> torch.Tensor:
+        batch_size = outputs.logits.shape[0]
+        model_choices = torch.zeros(batch_size, dtype=torch.int, device=outputs.logits.device)
+        self.state.last_model = "quick"
+        return model_choices
+
+
+class SlidingWindowEntropyJsSwitching(SlidingWindowEntropySwitching):
+    """Sliding-window entropy gate then JS (RPC in SLMServer)."""
+
+    def __init__(
+        self,
+        js_threshold: float = 0.05,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.js_threshold = float(js_threshold)
+        print(
+            "SlidingWindowEntropyJsSwitching: "
+            f"js_threshold={self.js_threshold}, "
+            f"window_size={self.window_size}, "
+            f"entropy_mean_threshold={self.entropy_mean_threshold}"
+        )
+
 
 class ImmediateSwitching(ModelSwitchingStrategy):
     
@@ -1220,6 +1421,164 @@ class EntropyNeuralSwitching(ModelSwitchingStrategy):
         return model_choices
 
 
+class EntropyMultitaskNeuralSwitching(ModelSwitchingStrategy):
+    """Two-stage routing like ``EntropyNeuralSwitching``, but the neural stage loads
+    ``train_router_multitask_js`` checkpoints (``best.pt`` with ``model_state``), not
+    ``load_model`` R2R router pickles.
+
+    1) Full-vocab Shannon entropy on the quick model's last-token logits (same as
+       ``EntropyNeuralSwitching`` / ``compute_entropy``): if entropy >= threshold → LLM.
+    2) Otherwise run ``RouterMultiTaskFFN4`` (top-100 logits, last hidden, last token id),
+       same head as ``MultitaskJSRouterSwitching`` without its internal top-k entropy gate.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        entropy_threshold: Optional[float] = None,
+        threshold: Optional[float] = None,
+        device: str = "cuda",
+        dtype=torch.float32,
+        pretrained_model_name: Optional[str] = None,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.entropy_threshold = (
+            float(entropy_threshold) if entropy_threshold is not None else 0.45
+        )
+        from r2r.models.multitask_js_router import RouterMultiTaskFFN4, RouterBottleneck2Block, RouterBottleneck3Block, RouterBottleneck3BlockV7, RouterBottleneck3BlockV8, RouterBottleneckR2R
+
+        try:
+            ckpt = torch.load(model_path, map_location=device, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(model_path, map_location=device)
+
+        saved = ckpt.get("args") or {}
+        oia = override_init_args or {}
+        pm = (
+            pretrained_model_name
+            or oia.get("pretrained_model_name")
+            or saved.get("pretrained_model_name")
+        )
+
+        self.logits_size = 100
+        model_type = saved.get("model_type", "ffn4")
+        if model_type == "bottleneck2":
+            self.model = RouterBottleneck2Block(
+                dropout=float(saved.get("dropout", 0.15)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        elif model_type == "bottleneck3":
+            self.model = RouterBottleneck3Block(
+                dropout=float(saved.get("dropout", 0.15)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        elif model_type == "bottleneck3_v7":
+            self.model = RouterBottleneck3BlockV7(
+                dropout=float(saved.get("dropout", 0.15)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        elif model_type == "bottleneck3_v8":
+            self.model = RouterBottleneck3BlockV8(
+                dropout=float(saved.get("dropout", 0.15)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        elif model_type == "bottleneck_r2r":
+            self.model = RouterBottleneckR2R(
+                dropout=float(saved.get("dropout", 0.3)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        else:
+            self.model = RouterMultiTaskFFN4(
+                ffn_dim=int(saved.get("ffn_dim", 768)),
+                dropout=float(saved.get("dropout", 0.12)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        self.model.load_state_dict(ckpt["model_state"], strict=True)
+        self.model.to(device)
+        self.model.eval()
+        self._is_v7 = isinstance(self.model, RouterBottleneck3BlockV7)
+        self._is_v8 = isinstance(self.model, RouterBottleneck3BlockV8)
+
+        if threshold is not None:
+            self.threshold = float(threshold)
+        elif ckpt.get("best_prob_threshold") is not None:
+            self.threshold = float(ckpt["best_prob_threshold"])
+        else:
+            self.threshold = 0.5
+
+        self.device = device
+        self.dtype = dtype
+        print(
+            f"EntropyMultitaskNeuralSwitching: entropy_threshold={self.entropy_threshold} "
+            f"(entropy >= → LLM), multitask_js neural threshold={self.threshold}, "
+            f"model_type={model_type}"
+        )
+
+    def _multitask_neural_route(self, outputs: ModelOutputs) -> torch.Tensor:
+        with torch.no_grad():
+            next_token_logits = outputs.logits[:, -1, :]
+            top_logits, _ = torch.topk(next_token_logits, k=self.logits_size, dim=-1)
+            logits = top_logits.to(device=self.device, dtype=torch.float32)
+            hidden_states = outputs.hidden_states[-1][:, -1, :].to(
+                device=self.device, dtype=torch.float32
+            )
+            token_ids = outputs.token[:, -1].to(device=self.device, dtype=torch.long)
+            if self._is_v7:
+                probs = torch.softmax(logits, dim=-1)
+                ent = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
+                cls_logits, _ = self.model(logits, hidden_states, token_ids, entropy=ent)
+            elif self._is_v8:
+                cls_logits, div_logits = self.model(logits, hidden_states, token_ids)
+            else:
+                cls_logits, _ = self.model(logits, hidden_states, token_ids)
+            critical_prob = torch.sigmoid(cls_logits.squeeze(-1))
+            if self._is_v8:
+                div_prob = torch.sigmoid(div_logits.squeeze(-1))
+                critical_prob = torch.maximum(critical_prob, div_prob)
+            self.last_route_scores = critical_prob.detach().cpu()
+            self.last_route_metric_name = "critical_prob"
+            return (critical_prob >= self.threshold).to(torch.int)
+
+    def route(self, outputs: ModelOutputs) -> torch.Tensor:
+        batch_size = outputs.logits.shape[0]
+        next_token_logits = outputs.logits[:, -1, :]
+        entropy_values = compute_entropy(next_token_logits)
+        self.last_route_scores = entropy_values.detach().cpu()
+        self.last_route_metric_name = "entropy_then_multitask_js_entropy"
+
+        high_entropy = entropy_values >= self.entropy_threshold
+        if bool(high_entropy.all().item()):
+            model_choices = torch.ones(
+                batch_size, dtype=torch.int, device=next_token_logits.device
+            )
+        elif bool((~high_entropy).all().item()):
+            model_choices = self._multitask_neural_route(outputs)
+        else:
+            neural_choices = self._multitask_neural_route(outputs)
+            model_choices = torch.where(
+                high_entropy,
+                torch.ones_like(neural_choices),
+                neural_choices,
+            )
+
+        self.state.last_model = "reference" if model_choices.any().item() else "quick"
+        return model_choices
+
+
 class NeuralRollingWindowSwitching(ModelSwitchingStrategy):
     """Neural network-based switching using a trained critical case classifier with rolling window"""
 
@@ -1527,12 +1886,179 @@ class RandomSwitching(ModelSwitchingStrategy):
         
         return model_choices
 
+class MultitaskJSRouterSwitching(ModelSwitchingStrategy):
+    """Hybrid router from train_router_multitask_js best.pt (RouterMultiTaskFFN4).
+    Uses top-100 logits, last-layer hidden, and last token id.
+    Entropy gate: tokens with entropy > entropy_threshold skip the router and go to reference.
+    """
+
+    def __init__(
+        self,
+        model_path: str,
+        threshold: Optional[float] = None,
+        entropy_threshold: Optional[float] = 0.6,
+        entropy_topk_k: int = 100,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.float32,
+        use_cuda_graph: bool = False,
+        pretrained_model_name: Optional[str] = None,
+        override_init_args: Optional[dict] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.device = device
+        self.dtype = dtype
+        self.entropy_threshold = float(entropy_threshold) if entropy_threshold is not None else None
+        self.entropy_topk_k = int(entropy_topk_k)
+
+        from r2r.models.multitask_js_router import RouterMultiTaskFFN4, RouterBottleneck2Block, RouterBottleneck3Block, RouterBottleneck3BlockV7, RouterBottleneck3BlockV8, RouterBottleneckR2R
+
+        try:
+            ckpt = torch.load(model_path, map_location=device, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(model_path, map_location=device)
+
+        saved = ckpt.get("args") or {}
+        pm = pretrained_model_name or saved.get("pretrained_model_name", None)
+
+        self.logits_size = 100
+        model_type = saved.get("model_type", "ffn4")
+        if model_type == "bottleneck2":
+            self.model = RouterBottleneck2Block(
+                dropout=float(saved.get("dropout", 0.15)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        elif model_type == "bottleneck3":
+            self.model = RouterBottleneck3Block(
+                dropout=float(saved.get("dropout", 0.15)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        elif model_type == "bottleneck3_v7":
+            self.model = RouterBottleneck3BlockV7(
+                dropout=float(saved.get("dropout", 0.15)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        elif model_type == "bottleneck3_v8":
+            self.model = RouterBottleneck3BlockV8(
+                dropout=float(saved.get("dropout", 0.15)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        elif model_type == "bottleneck_r2r":
+            self.model = RouterBottleneckR2R(
+                dropout=float(saved.get("dropout", 0.3)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        else:
+            self.model = RouterMultiTaskFFN4(
+                ffn_dim=int(saved.get("ffn_dim", 768)),
+                dropout=float(saved.get("dropout", 0.12)),
+                normalize_inputs=not bool(saved.get("no_input_layernorm", False)),
+                freeze_token_embeddings=bool(saved.get("freeze_token_embeddings", False)),
+                pretrained_model_name=pm,
+            )
+        self.model.load_state_dict(ckpt["model_state"], strict=True)
+        self.model.to(device)
+        self.model.eval()
+        self._is_v7 = isinstance(self.model, RouterBottleneck3BlockV7)
+        self._is_v8 = isinstance(self.model, RouterBottleneck3BlockV8)
+
+        self.threshold = float(threshold) if threshold is not None else 0.5
+        print(
+            f"MultitaskJSRouter: threshold={self.threshold}, "
+            f"entropy_threshold={self.entropy_threshold}, "
+            f"entropy_topk_k={self.entropy_topk_k}, "
+            f"model_type={model_type}"
+        )
+        print(f"MultitaskJSRouter loaded from {model_path}")
+
+    def route(self, outputs):
+        batch_size = outputs.logits.shape[0]
+        with torch.no_grad():
+            next_token_logits = outputs.logits[:, -1, :]
+            top_logits, _ = torch.topk(next_token_logits, k=self.logits_size, dim=-1)
+            logits = top_logits.to(device=self.device, dtype=torch.float32)
+
+            model_choices = torch.zeros(batch_size, dtype=torch.int, device=self.device)
+
+            if self.entropy_threshold is not None:
+                probs = torch.softmax(logits, dim=-1)
+                entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
+                high_entropy_mask = entropy > self.entropy_threshold
+                model_choices[high_entropy_mask] = 1
+
+                low_entropy_mask = ~high_entropy_mask
+                if not low_entropy_mask.any():
+                    self.last_route_scores = entropy.detach().cpu()
+                    self.last_route_metric_name = "entropy"
+                    self.state.last_model = "reference" if model_choices.any().item() else "quick"
+                    return model_choices
+
+                logits_sub = logits[low_entropy_mask]
+                hidden_states_sub = outputs.hidden_states[-1][:, -1, :][low_entropy_mask].to(
+                    device=self.device, dtype=torch.float32
+                )
+                token_sub = outputs.token[:, -1][low_entropy_mask].to(
+                    device=self.device, dtype=torch.long
+                )
+            else:
+                hidden_states_sub = outputs.hidden_states[-1][:, -1, :].to(
+                    device=self.device, dtype=torch.float32
+                )
+                token_sub = outputs.token[:, -1].to(device=self.device, dtype=torch.long)
+                logits_sub = logits
+
+            if self._is_v7:
+                ent_sub = entropy[low_entropy_mask] if self.entropy_threshold is not None else None
+                if ent_sub is None:
+                    probs_all = torch.softmax(logits_sub, dim=-1)
+                    ent_sub = -(probs_all * torch.log(probs_all.clamp_min(1e-12))).sum(dim=-1)
+                cls_logits, _ = self.model(logits_sub, hidden_states_sub, token_sub, entropy=ent_sub)
+            elif self._is_v8:
+                cls_logits, div_logits = self.model(logits_sub, hidden_states_sub, token_sub)
+            else:
+                cls_logits, _ = self.model(logits_sub, hidden_states_sub, token_sub)
+            critical_prob = torch.sigmoid(cls_logits.squeeze(-1))
+            if self._is_v8:
+                div_prob = torch.sigmoid(div_logits.squeeze(-1))
+                critical_prob = torch.maximum(critical_prob, div_prob)
+
+            self.last_route_scores = critical_prob.detach().cpu()
+            self.last_route_metric_name = "critical_prob"
+
+            if self.entropy_threshold is not None:
+                router_choices = (critical_prob >= self.threshold).to(torch.int)
+                model_choices[low_entropy_mask] = router_choices
+            else:
+                model_choices = (critical_prob >= self.threshold).to(torch.int)
+
+            self.state.last_model = "reference" if model_choices.any().item() else "quick"
+            return model_choices
+
+
+
 def create_switching_strategy(strategy_name: str, **kwargs) -> ModelSwitchingStrategy:
     """Factory function to create switching strategy instances"""
     strategies = {
         'immediate': ImmediateSwitching,
         'entropy': EntropySwitching,
         'entropy_neural': EntropyNeuralSwitching,
+        'entropy_then_neural': EntropyNeuralSwitching,
+        'entropy_neural_multitask_js': EntropyMultitaskNeuralSwitching,
+        'entropy_then_neural_multitask_js': EntropyMultitaskNeuralSwitching,
+        'entropy_lookahead': EntropyLookaheadSwitching,
+        'entropy_variance_js': EntropyVarianceJsSwitching,
+        'sliding_window_entropy': SlidingWindowEntropySwitching,
+        'sliding_window_entropy_js': SlidingWindowEntropyJsSwitching,
         'entropy_drift': EntropyDriftSwitching,
         'entropy_topk': EntropyTopKSwitching,
         'js': JSSwitching,
@@ -1550,6 +2076,7 @@ def create_switching_strategy(strategy_name: str, **kwargs) -> ModelSwitchingStr
         'neural': NeuralSwitching,
         'neural_rolling': NeuralRollingWindowSwitching,
         'neural_multi_input': NeuralMultiInputSwitching,
+        'multitask_js_router': MultitaskJSRouterSwitching,
         'random': RandomSwitching
     }
     

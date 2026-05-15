@@ -48,6 +48,20 @@ if is_flashinfer_available():
     from flashinfer.decode import _get_range_buf, get_seq_lens
 
 
+def _env_workspace_size_bytes() -> Optional[int]:
+    """Read flashinfer workspace size override from env in MiB."""
+    workspace_mb = os.getenv("R2R_FLASHINFER_WORKSPACE_MB")
+    if workspace_mb is None:
+        return None
+    try:
+        value = int(workspace_mb)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value * 1024 * 1024
+
+
 @dataclass
 class ExtendMetadata:
     prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper]
@@ -87,23 +101,51 @@ def __init__(
         self.num_wrappers = 1
         self.dispatch_reason = None
 
-    # Qwen2/Qwen3 models require higher flashinfer workspace size
+    # Qwen2/Qwen3 models usually need a larger workspace, but 512 MiB can
+    # fail to allocate on busy GPUs. Keep a safer default and allow override.
+    env_workspace_size = _env_workspace_size_bytes()
     if (
         "Qwen2ForCausalLM" in model_runner.model_config.hf_config.architectures
         or "Qwen3ForCausalLM" in model_runner.model_config.hf_config.architectures
         or "MiMoForCausalLM" in model_runner.model_config.hf_config.architectures
     ):
-        global_config.flashinfer_workspace_size = 512 * 1024 * 1024
+        global_config.flashinfer_workspace_size = 256 * 1024 * 1024
+    if env_workspace_size is not None:
+        global_config.flashinfer_workspace_size = env_workspace_size
 
     # Allocate buffers
     # global global_workspace_buffer
     if flashinfer_backend.global_workspace_buffer is None:
-        # different from flashinfer zero_init_global_workspace_buffer
-        flashinfer_backend.global_workspace_buffer = torch.empty(
-            global_config.flashinfer_workspace_size,
-            dtype=torch.uint8,
-            device=model_runner.device,
-        )
+        # Different from flashinfer zero_init_global_workspace_buffer.
+        # If allocation OOMs, progressively halve workspace to improve robustness
+        # under heavy multi-tenant GPU memory pressure.
+        requested_size = global_config.flashinfer_workspace_size
+        min_size = 64 * 1024 * 1024
+        workspace_size = requested_size
+        last_oom = None
+        while workspace_size >= min_size:
+            try:
+                flashinfer_backend.global_workspace_buffer = torch.empty(
+                    workspace_size,
+                    dtype=torch.uint8,
+                    device=model_runner.device,
+                )
+                global_config.flashinfer_workspace_size = workspace_size
+                break
+            except torch.OutOfMemoryError as e:
+                last_oom = e
+                if workspace_size == min_size:
+                    break
+                workspace_size = max(min_size, workspace_size // 2)
+
+        if flashinfer_backend.global_workspace_buffer is None:
+            raise RuntimeError(
+                "Failed to allocate flashinfer workspace buffer. "
+                f"Requested {requested_size // (1024 * 1024)} MiB, retried down to "
+                f"{min_size // (1024 * 1024)} MiB. "
+                "Try freeing GPU memory or setting R2R_FLASHINFER_WORKSPACE_MB "
+                "to a smaller value."
+            ) from last_oom
     self.workspace_buffer = flashinfer_backend.global_workspace_buffer
     max_bs = model_runner.req_to_token_pool.size
     if kv_indptr_buf is None:

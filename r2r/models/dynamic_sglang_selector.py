@@ -66,7 +66,7 @@ class DynamicSimpleSGLangSelector:
 
         self.quick_server_args = ServerArgs(
             model_path=self.model_config["quick"]["model_path"],
-            disable_cuda_graph=False,
+            disable_cuda_graph=True,
             disable_overlap_schedule=True,
             disable_radix_cache=False,
             mem_fraction_static=self.model_config["quick"].get("mem_fraction_static", 0.9),

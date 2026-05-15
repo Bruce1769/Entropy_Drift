@@ -214,6 +214,15 @@ def init_generator(args: argparse.Namespace) -> Tuple[AutoTokenizer, SLDisaggreg
     router_config = args.model_config.get("router", {})
     switching_strategy = router_config.get("switching_strategy", "neural")
     strategy_kwargs: Dict[str, Any] = {}
+    if switching_strategy in {
+        "neural",
+        "entropy_neural",
+        "entropy_then_neural",
+        "entropy_neural_multitask_js",
+        "entropy_then_neural_multitask_js",
+    }:
+        if "threshold" in router_config:
+            strategy_kwargs["threshold"] = router_config["threshold"]
     if "js_threshold" in router_config:
         strategy_kwargs["js_threshold"] = router_config["js_threshold"]
     if "js_topk" in router_config:

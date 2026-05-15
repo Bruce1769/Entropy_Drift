@@ -29,25 +29,33 @@ from r2r.utils.switching import create_switching_strategy
 from r2r.utils.token_manager import SGLangTokenManager
 from r2r.utils.dataclass import ModelOutputs
 from r2r.utils.sampling import sample_token
-from r2r.utils.metrics import (
-    extract_topk_logits,
-    compute_js_divergence,
-    compute_sparse_topk_js_divergence,
-    compute_entropy,
+from r2r.utils.metrics import log_prob_of_token
+from r2r.models.sglang_patch.schedule_req import (
+    WaitingReq,
+    SimpleSamplingParams,
+    EntropyLookaheadRpc,
+    EntropyLookaheadResp,
+    SlidingWindowJsRpc,
+    SlidingWindowJsResp,
+    NextTokenJsRpc,
+    NextTokenJsAbortRpc,
+    NextTokenJsResp,
 )
-from r2r.models.sglang_patch.schedule_req import WaitingReq, SimpleSamplingParams
 from r2r.models.sglang_patch.llm_scheduler import LLMScheduler
 
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, ForwardMode, SamplingBatchInfo, write_req_to_token_pool_triton
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    ForwardMode,
+    SamplingBatchInfo,
+    get_last_loc,
+    write_req_to_token_pool_triton,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.utils import broadcast_pyobj
-
-def _get_top1_prob(logits: torch.Tensor) -> float:
-    probs = torch.softmax(logits.to(dtype=torch.float32), dim=-1)
-    return float(torch.max(probs).item())
 
 class LLMServer:
     """LLM Server launched by SGLang"""
@@ -63,6 +71,8 @@ class LLMServer:
         mem_fraction_static: Optional[float] = None,
         llm_kvcache_size: Optional[Value] = None,
         min_batch_size: Union[int, list[int]] = 1,
+        entropy_lookahead_query_queue: Optional[mp.Queue] = None,
+        entropy_lookahead_reply_queue: Optional[mp.Queue] = None,
     ):
         self.is_reset_cache = False
         self.shutdown_loop = False
@@ -144,11 +154,19 @@ class LLMServer:
             print(f"Only support flashinfer attention backend for reference model.")
             reference_sglang_kwargs["attention_backend"] = "flashinfer"
         
+        # Entropy lookahead issues many long one-off prefills on the reference model.
+        # - disable_cuda_graph: frees graph-capture / private-pool memory that contributed to CUDA OOM.
+        # - radix cache on: shared prefix across lookahead contexts (base+draft[:k]) cuts redundant KV work.
+        # - smaller chunked_prefill_size: lowers peak activation memory on long prefills (override via env).
+        _chunk_prefill = int(
+            os.environ.get("R2R_REFERENCE_CHUNKED_PREFILL", "1024")
+        )
         reference_server_args = ServerArgs(
             model_path=self.model_config["reference"]["model_path"],
-            disable_cuda_graph=False,
+            disable_cuda_graph=True,
             disable_overlap_schedule=True,
-            disable_radix_cache=True,
+            disable_radix_cache=False,
+            chunked_prefill_size=_chunk_prefill,
             mem_fraction_static=mem_fraction_static,
             **reference_sglang_kwargs,
         )
@@ -158,6 +176,8 @@ class LLMServer:
         self._recv_thread = None  # Deprecated broadcast SUB thread removed.
         self.reference_model_procs = []
         self.llm_kvcache_size = llm_kvcache_size
+        self.entropy_lookahead_query_queue = entropy_lookahead_query_queue
+        self.entropy_lookahead_reply_queue = entropy_lookahead_reply_queue
         for rank in range(reference_num_gpus):
             proc = mp.Process(
                 target=self.reference_model_worker,
@@ -172,6 +192,8 @@ class LLMServer:
                     self.queue_to_slm,
                     self.llm_kvcache_size if rank == 0 else None,
                     min_batch_size,
+                    self.entropy_lookahead_query_queue,
+                    self.entropy_lookahead_reply_queue,
                 ),
             )
             # Mark as daemon so that workers die when parent exits unexpectedly
@@ -180,44 +202,422 @@ class LLMServer:
             self.reference_model_procs.append(proc)
 
     @staticmethod
-    def reference_model_worker(rank, quick_num_gpus: int, world_size: int, server_args: ServerArgs, master_port: int = 29500, ready_queue: Optional[mp.Queue] = None, inbound_queue: Optional[mp.Queue] = None, outbound_queue: Optional[mp.Queue] = None, llm_kvcache_size: Optional[Value] = None, min_batch_size: Union[int, list[int]] = 1):
+    def _free_evjs_stash_entry(scheduler: Scheduler, rid: str) -> None:
+        """Release KV for a fused NextTokenJsRpc prefill that will not be continued."""
+        st = getattr(scheduler, "_r2r_evjs_stash", None)
+        if not st:
+            return
+        entry = st.pop(rid, None)
+        if not entry:
+            return
+        req = entry["req"]
+        kv_locs = entry.get("kv_locs")
+        try:
+            if kv_locs is not None and kv_locs.numel() > 0:
+                scheduler.token_to_kv_pool_allocator.free(kv_locs)
+        except Exception:
+            pass
+        try:
+            if getattr(req, "req_pool_idx", None) is not None:
+                scheduler.req_to_token_pool.free(req.req_pool_idx)
+        except Exception:
+            pass
+        try:
+            scheduler.abort_request(AbortReq(rid))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _llm_one_off_forward_logits_persist(scheduler: Scheduler, context_ids: List[int], rid: str) -> torch.Tensor:
+        """Keeps KV for EVJS_CONTINUE. Reuses stashed KV when possible (incremental extend)."""
+        rid = str(rid)
+        if not hasattr(scheduler, "_r2r_evjs_stash"):
+            scheduler._r2r_evjs_stash = {}
+
+        stash = scheduler._r2r_evjs_stash.get(rid)
+        if stash is not None:
+            try:
+                row = LLMServer._llm_incremental_forward(
+                    scheduler, stash, context_ids, rid
+                )
+                if row is not None:
+                    return row
+            except Exception as e:
+                print(f"[evjs-incr-fallback] rid={rid} error={e}, falling back to full prefill", flush=True)
+            LLMServer._free_evjs_stash_entry(scheduler, rid)
+        else:
+            LLMServer._free_evjs_stash_entry(scheduler, rid)
+
+        return LLMServer._llm_full_prefill_persist(scheduler, context_ids, rid)
+
+    @staticmethod
+    def _llm_incremental_forward(
+        scheduler: Scheduler, stash: dict, context_ids: List[int], rid: str,
+    ) -> Optional[torch.Tensor]:
+        """Extend stashed KV with new tokens only. Returns None if extension not possible."""
+        old_req = stash["req"]
+        old_len = stash.get("context_len", len(list(old_req.origin_input_ids)))
+        new_len = len(context_ids)
+        if new_len <= old_len:
+            return None
+        old_prefix = list(old_req.origin_input_ids)
+        if context_ids[:old_len] != old_prefix[:old_len]:
+            return None
+        old_pool_idx = getattr(old_req, "req_pool_idx", None)
+        if old_pool_idx is None:
+            return None
+
+        new_tokens = context_ids[old_len:]
+        n_new = len(new_tokens)
+
+        sp = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_new_tokens=1, stop=[])
+        sp.normalize(None)
+        req = Req(
+            rid=rid,
+            origin_input_text="",
+            origin_input_ids=context_ids,
+            sampling_params=sp,
+            eos_token_ids=scheduler.model_config.hf_eos_token_id,
+            return_hidden_states=False,
+            vocab_size=scheduler.model_config.vocab_size,
+            status="need",
+        )
+        req.req_pool_idx = old_pool_idx
+        req.output_ids = []
+        req.fill_ids = list(context_ids)
+        req.extend_input_len = n_new
+        req.already_computed = old_len
+        req.cached_tokens = old_len
+        req.is_retracted = False
+        req.prefix_indices = [0] * old_len
+
+        batch = ScheduleBatch.init_new(
+            [req],
+            scheduler.req_to_token_pool,
+            scheduler.token_to_kv_pool_allocator,
+            scheduler.tree_cache,
+            scheduler.model_config,
+            scheduler.enable_overlap,
+            scheduler.spec_algorithm,
+            scheduler.server_args.enable_custom_logit_processor,
+        )
+        batch.forward_mode = ForwardMode.EXTEND
+        if not hasattr(req, "device"):
+            req.device = batch.device
+        device = batch.device
+
+        if batch.token_to_kv_pool_allocator.page_size == 1:
+            out_cache_loc = batch.alloc_token_slots(n_new)
+        else:
+            prefix_t = torch.tensor([old_len], dtype=torch.int64, device=device)
+            seq_t = torch.tensor([new_len], dtype=torch.int64, device=device)
+            pool_t = torch.tensor([old_pool_idx], dtype=torch.int64, device=device)
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token, pool_t, prefix_t,
+            )
+            out_cache_loc = batch.alloc_paged_token_slots_extend(
+                prefix_t, seq_t, last_loc, n_new,
+            )
+
+        input_ids_t = torch.tensor(new_tokens, dtype=torch.int64, device=device)
+        req_pool_t = torch.tensor([old_pool_idx], dtype=torch.int64, device=device)
+        seq_lens_t = torch.tensor([new_len], dtype=torch.int64, device=device)
+        prefix_lens_t = torch.tensor([old_len], dtype=torch.int64, device=device)
+        extend_lens_t = seq_lens_t - prefix_lens_t
+
+        write_req_to_token_pool_triton[(1,)](
+            batch.req_to_token_pool.req_to_token,
+            req_pool_t,
+            prefix_lens_t,
+            seq_lens_t,
+            extend_lens_t,
+            out_cache_loc,
+            batch.req_to_token_pool.req_to_token.shape[1],
+        )
+
+        batch.input_ids = input_ids_t
+        batch.req_pool_indices = req_pool_t
+        batch.seq_lens = seq_lens_t
+        batch.out_cache_loc = out_cache_loc
+        batch.input_embeds = None
+        batch.seq_lens_sum = new_len
+        batch.extend_logprob_start_lens = [0]
+        batch.extend_num_tokens = n_new
+        batch.prefix_lens = [old_len]
+        batch.extend_lens = [n_new]
+        batch.return_logprob = False
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, batch.model_config.vocab_size,
+        )
+
+        model_batch = batch.get_model_worker_batch()
+        result = scheduler.tp_worker.forward_batch_generation(model_batch)
+        logits_output = result[0] if isinstance(result, tuple) else result.logits_output
+        row = logits_output.next_token_logits[0].float()
+
+        all_kv = torch.cat([stash.get("kv_locs", torch.tensor([], device=device)), out_cache_loc])
+        scheduler._r2r_evjs_stash[rid] = {
+            "req": req,
+            "kv_locs": all_kv,
+            "context_len": new_len,
+        }
+        if os.environ.get("R2R_LOG_EVJS_ALL", "").strip().lower() in ("1", "true", "yes", "on"):
+            print(
+                f"[evjs-incr-ok] rid={rid} old_len={old_len} new_len={new_len} "
+                f"delta={n_new} kv_total={all_kv.numel()}",
+                flush=True,
+            )
+        return row
+
+    @staticmethod
+    def _llm_full_prefill_persist(scheduler: Scheduler, context_ids: List[int], rid: str) -> torch.Tensor:
+        """Full-context prefill, stashing KV for potential EVJS_CONTINUE reuse."""
+        sp = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_new_tokens=1, stop=[])
+        sp.normalize(None)
+        req = Req(
+            rid=rid,
+            origin_input_text=scheduler.tokenizer.decode(context_ids),
+            origin_input_ids=context_ids,
+            sampling_params=sp,
+            eos_token_ids=scheduler.model_config.hf_eos_token_id,
+            return_hidden_states=False,
+            vocab_size=scheduler.model_config.vocab_size,
+            status="need",
+        )
+        req.prefix_indices = []
+        req.output_ids = []
+        req.fill_ids = list(context_ids)
+        req.extend_input_len = len(req.fill_ids)
+        req.init_next_round_input(scheduler.tree_cache)
+        new_batch = ScheduleBatch.init_new(
+            [req],
+            scheduler.req_to_token_pool,
+            scheduler.token_to_kv_pool_allocator,
+            scheduler.tree_cache,
+            scheduler.model_config,
+            scheduler.enable_overlap,
+            scheduler.spec_algorithm,
+            scheduler.server_args.enable_custom_logit_processor,
+        )
+        if not hasattr(req, "device"):
+            req.device = new_batch.device
+        LLMServer.simple_prepare_for_extend(new_batch)
+        model_batch = new_batch.get_model_worker_batch()
+        kv_locs = new_batch.out_cache_loc
+        try:
+            result = scheduler.tp_worker.forward_batch_generation(model_batch)
+            logits_output = result[0] if isinstance(result, tuple) else result.logits_output
+            row = logits_output.next_token_logits[0].float()
+            scheduler._r2r_evjs_stash[rid] = {
+                "req": req,
+                "kv_locs": kv_locs,
+                "context_len": len(context_ids),
+            }
+            return row
+        except Exception:
+            try:
+                if kv_locs is not None and kv_locs.numel() > 0:
+                    scheduler.token_to_kv_pool_allocator.free(kv_locs)
+            except Exception:
+                pass
+            try:
+                if getattr(req, "req_pool_idx", None) is not None:
+                    scheduler.req_to_token_pool.free(req.req_pool_idx)
+            except Exception:
+                pass
+            try:
+                scheduler.abort_request(AbortReq(rid))
+            except Exception:
+                pass
+            raise
+
+    @staticmethod
+    def _llm_one_off_forward_logits(scheduler: Scheduler, context_ids: List[int]) -> torch.Tensor:
+        rid = f"_elb_{uuid.uuid4()}"
+        sp = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_new_tokens=1, stop=[])
+        sp.normalize(None)
+        req = Req(
+            rid=rid,
+            origin_input_text=scheduler.tokenizer.decode(context_ids),
+            origin_input_ids=context_ids,
+            sampling_params=sp,
+            eos_token_ids=scheduler.model_config.hf_eos_token_id,
+            return_hidden_states=False,
+            vocab_size=scheduler.model_config.vocab_size,
+            status="need",
+        )
+        req.prefix_indices = []
+        req.output_ids = []
+        req.fill_ids = list(context_ids)
+        req.extend_input_len = len(req.fill_ids)
+        req.init_next_round_input(scheduler.tree_cache)
+        new_batch = ScheduleBatch.init_new(
+            [req],
+            scheduler.req_to_token_pool,
+            scheduler.token_to_kv_pool_allocator,
+            scheduler.tree_cache,
+            scheduler.model_config,
+            scheduler.enable_overlap,
+            scheduler.spec_algorithm,
+            scheduler.server_args.enable_custom_logit_processor,
+        )
+        if not hasattr(req, "device"):
+            req.device = new_batch.device
+        LLMServer.simple_prepare_for_extend(new_batch)
+        model_batch = new_batch.get_model_worker_batch()
+        kv_locs = new_batch.out_cache_loc
+        try:
+            result = scheduler.tp_worker.forward_batch_generation(model_batch)
+            logits_output = result[0] if isinstance(result, tuple) else result.logits_output
+            # Single-token extend: one row
+            return logits_output.next_token_logits[0].float()
+        finally:
+            try:
+                if kv_locs is not None and kv_locs.numel() > 0:
+                    scheduler.token_to_kv_pool_allocator.free(kv_locs)
+            except Exception:
+                pass
+            try:
+                if getattr(req, "req_pool_idx", None) is not None:
+                    scheduler.req_to_token_pool.free(req.req_pool_idx)
+            except Exception:
+                pass
+            try:
+                scheduler.abort_request(AbortReq(rid))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _entropy_lookahead_llm_logprobs(scheduler: Scheduler, rpc: EntropyLookaheadRpc) -> EntropyLookaheadResp:
+        try:
+            lps = []
+            for ctx, tid in zip(rpc.contexts, rpc.tokens):
+                L = LLMServer._llm_one_off_forward_logits(scheduler, ctx)
+                lps.append(log_prob_of_token(L, int(tid)))
+            return EntropyLookaheadResp(query_id=rpc.query_id, logprobs=lps, ok=True)
+        except Exception as e:
+            return EntropyLookaheadResp(
+                query_id=rpc.query_id, logprobs=[], ok=False, error=str(e)
+            )
+
+    @staticmethod
+    def _next_token_js_llm_logits(scheduler: Scheduler, rpc: NextTokenJsRpc) -> NextTokenJsResp:
+        try:
+            if getattr(rpc, "rid", None):
+                row = LLMServer._llm_one_off_forward_logits_persist(
+                    scheduler, list(rpc.context_ids), str(rpc.rid)
+                )
+            else:
+                row = LLMServer._llm_one_off_forward_logits(scheduler, list(rpc.context_ids))
+            k = max(1, int(os.environ.get("R2R_EVJS_TOPK", "16")))
+            probs = torch.softmax(row.float(), dim=-1)
+            k = min(k, int(probs.numel()))
+            vals, idx = torch.topk(probs, k=k, dim=-1)
+            tail = float(torch.clamp(1.0 - vals.sum(), min=0.0).item())
+            return NextTokenJsResp(
+                query_id=rpc.query_id,
+                llm_topk_indices=[int(x) for x in idx.detach().cpu().tolist()],
+                llm_topk_probs=[float(x) for x in vals.detach().cpu().tolist()],
+                llm_tail_mass=tail,
+                topk=int(k),
+                ok=True,
+            )
+        except Exception as e:
+            return NextTokenJsResp(
+                query_id=rpc.query_id,
+                llm_logits=None,
+                ok=False,
+                error=str(e),
+            )
+
+    @staticmethod
+    def _sliding_window_js_llm_logits(scheduler: Scheduler, rpc: SlidingWindowJsRpc) -> SlidingWindowJsResp:
+        try:
+            full_ids = list(rpc.full_ids)
+            B = int(rpc.base_len)
+            n = int(rpc.window_size)
+            if B < 0 or n < 1 or B > len(full_ids):
+                raise ValueError(
+                    f"invalid SlidingWindowJsRpc: base_len={B}, window_size={n}, len(full_ids)={len(full_ids)}"
+                )
+            L = len(full_ids) - B
+            if L < n:
+                raise ValueError(f"draft segment too short: L={L} < n={n}")
+            # SGLang prefill only exposes next_token_logits at the *last* position per request
+            # (see LogitsProcessor: extend without input logprobs uses last_index only).
+            # So we cannot get a [seq_len, vocab] matrix from one forward; compute each
+            # window row with the same prefix as SLM: context_j = full_ids[: B+L-n+j].
+            outs = []
+            for j in range(n):
+                ctx = full_ids[: B + L - n + j]
+                row = LLMServer._llm_one_off_forward_logits(scheduler, ctx)
+                outs.append(row.detach().cpu().numpy())
+            return SlidingWindowJsResp(query_id=rpc.query_id, llm_logits=outs, ok=True)
+        except Exception as e:
+            return SlidingWindowJsResp(
+                query_id=rpc.query_id, llm_logits=[], ok=False, error=str(e)
+            )
+
+    @staticmethod
+    def reference_model_worker(rank, quick_num_gpus: int, world_size: int, server_args: ServerArgs, master_port: int = 29500, ready_queue: Optional[mp.Queue] = None, inbound_queue: Optional[mp.Queue] = None, outbound_queue: Optional[mp.Queue] = None, llm_kvcache_size: Optional[Value] = None, min_batch_size: Union[int, list[int]] = 1, entropy_lookahead_query_queue: Optional[mp.Queue] = None, entropy_lookahead_reply_queue: Optional[mp.Queue] = None):
         # Register signal handler to ensure finally block execution on terminate
         def _worker_sig_handler(signum, frame):
             sys.exit(0)
         signal.signal(signal.SIGTERM, _worker_sig_handler)
-        scheduler = None
-        try:
-            # Use a dedicated tcp init_method to avoid port collision with quick model's default 29500 store
-            init_method = f"tcp://127.0.0.1:{master_port}"
-            dist.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=world_size)
-            torch.cuda.set_device(rank + quick_num_gpus)
+        # Use a dedicated tcp init_method to avoid port collision with quick model's default 29500 store
+        init_method = f"tcp://127.0.0.1:{master_port}"
+        dist.init_process_group(backend='nccl', init_method=init_method, rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank + quick_num_gpus)
 
-            port_args = PortArgs.init_new(server_args)
-            scheduler = LLMScheduler(
-                server_args=server_args,
-                port_args=port_args,
-                gpu_id=rank+quick_num_gpus,
-                tp_rank=rank,
-                dp_rank=0,
-                moe_ep_rank=0,
-                pp_rank=0, # Pipeline parallelism is not Supported
-                llm_kvcache_size=llm_kvcache_size,
-                min_batch_size=min_batch_size,
-            )
-            print(f"[reference rank {rank}] attn_tp_rank: {scheduler.attn_tp_rank}")
-            
-            # Signal readiness
-            if ready_queue is not None:
-                try:
-                    ready_queue.put(("READY", rank, scheduler.tokenizer if rank == 0 else None))
-                except Exception as e:
-                    print(f"[rank {rank}] failed to put READY: {e}")
-            
-            LLMServer.init_batch_not_need(scheduler)
-            print(f"Reference model worker {rank} started, waiting for requests...")
-            
-            # event_loop
+        port_args = PortArgs.init_new(server_args)
+        scheduler = LLMScheduler(
+            server_args=server_args,
+            port_args=port_args,
+            gpu_id=rank+quick_num_gpus,
+            tp_rank=rank,
+            dp_rank=0,
+            moe_ep_rank=0,
+            pp_rank=0, # Pipeline parallelism is not Supported
+            llm_kvcache_size=llm_kvcache_size,
+            min_batch_size=min_batch_size,
+        )
+        print(f"[reference rank {rank}] attn_tp_rank: {scheduler.attn_tp_rank}")
+        
+        # Signal readiness
+        if ready_queue is not None:
+            try:
+                ready_queue.put(("READY", rank, scheduler.tokenizer if rank == 0 else None))
+            except Exception as e:
+                print(f"[rank {rank}] failed to put READY: {e}")
+        
+        LLMServer.init_batch_not_need(scheduler)
+        print(f"Reference model worker {rank} started, waiting for requests...")
+        
+        # event_loop
+        try:
             while True:
+                if (
+                    rank == 0
+                    and entropy_lookahead_query_queue is not None
+                    and entropy_lookahead_reply_queue is not None
+                ):
+                    while True:
+                        try:
+                            rpc = entropy_lookahead_query_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if isinstance(rpc, EntropyLookaheadRpc):
+                            resp = LLMServer._entropy_lookahead_llm_logprobs(scheduler, rpc)
+                            entropy_lookahead_reply_queue.put(resp)
+                        elif isinstance(rpc, SlidingWindowJsRpc):
+                            resp = LLMServer._sliding_window_js_llm_logits(scheduler, rpc)
+                            entropy_lookahead_reply_queue.put(resp)
+                        elif isinstance(rpc, NextTokenJsRpc):
+                            resp = LLMServer._next_token_js_llm_logits(scheduler, rpc)
+                            entropy_lookahead_reply_queue.put(resp)
+                        elif isinstance(rpc, NextTokenJsAbortRpc):
+                            pass
+
                 if inbound_queue is not None: # Process message from LLM
                     slm_reqs = LLMServer.recv_reqs_from_slm(
                         inbound_queue=inbound_queue,
@@ -255,12 +655,8 @@ class LLMServer:
         except BaseException as e:
             # Any unexpected error -> exit loop to avoid orphaned NCCL workers
             print(f"[rank {rank}] reference worker fatal error: {e}. Exiting loop.")
+            import traceback
             traceback.print_exc()
-            if ready_queue is not None:
-                try:
-                    ready_queue.put(("ERROR", rank, traceback.format_exc()))
-                except Exception:
-                    pass
         finally:
             try:
                 if dist.is_initialized():
@@ -290,43 +686,117 @@ class LLMServer:
         )
 
     @staticmethod
+    def _retract_rid_from_batch_not_need(scheduler: Scheduler, rid) -> None:
+        """Drop cached LLM state for ``rid`` so the next message can full-prefill from ``new_token_ids``."""
+        if scheduler.batch_not_need is None or not scheduler.batch_not_need.reqs:
+            return
+        not_keep = [
+            i
+            for i, r in enumerate(scheduler.batch_not_need.reqs)
+            if r.rid == rid
+        ]
+        if not not_keep:
+            return
+        for i in not_keep:
+            try:
+                r = scheduler.batch_not_need.reqs[i]
+                if getattr(r, "last_node", None) is not None:
+                    scheduler.tree_cache.cache_finished_req(r)
+            except Exception:
+                pass
+        keep_indices = [
+            i for i in range(len(scheduler.batch_not_need.reqs)) if i not in not_keep
+        ]
+        scheduler.batch_not_need.filter_batch(keep_indices=keep_indices)
+        scheduler.n_active_reqs = max(0, int(getattr(scheduler, "n_active_reqs", 0)) - len(not_keep))
+
+    @staticmethod
+    def _enqueue_full_prefill_waiting_req(scheduler: Scheduler, waiting_req: WaitingReq) -> None:
+        """First-time LLM prefill: ``new_token_ids`` is the full prompt + generated prefix."""
+        if scheduler.batch_not_need is None:
+            LLMServer.init_batch_not_need(scheduler)
+        scheduler.n_active_reqs += 1
+        origin_input_ids = waiting_req.new_token_ids
+        origin_input_text = scheduler.tokenizer.decode(origin_input_ids)
+        new_req = Req(
+            rid=waiting_req.rid,
+            origin_input_text=origin_input_text,
+            origin_input_ids=origin_input_ids,
+            sampling_params=waiting_req.sampling_params.derive_sampling_params(),
+            eos_token_ids=scheduler.model_config.hf_eos_token_id,
+            return_hidden_states=False,
+            vocab_size=scheduler.model_config.vocab_size,
+            status="need",
+            last_cached_loc=[],
+        )
+        if not hasattr(new_req, "device"):
+            new_req.device = scheduler.batch_not_need.device
+        scheduler.waiting_queue.append(new_req)
+
+    @staticmethod
+    def _evjs_handle_continue(scheduler: Scheduler, waiting_req: WaitingReq) -> None:
+        """Continue after fused JS prefill: reuse KV when stash matches, else full prefill fallback."""
+        rid = str(waiting_req.rid)
+        full_ids = list(waiting_req.new_token_ids)
+        st = getattr(scheduler, "_r2r_evjs_stash", None)
+        entry = st.pop(rid, None) if st else None
+        if scheduler.batch_not_need is None:
+            LLMServer.init_batch_not_need(scheduler)
+        if entry is None:
+            LLMServer._enqueue_full_prefill_waiting_req(scheduler, waiting_req)
+            return
+        req_old = entry["req"]
+        prefix = list(req_old.origin_input_ids)
+        if len(full_ids) < len(prefix) or full_ids[: len(prefix)] != prefix:
+            LLMServer._enqueue_full_prefill_waiting_req(scheduler, waiting_req)
+            return
+        origin_input_ids = full_ids
+        origin_input_text = scheduler.tokenizer.decode(origin_input_ids)
+        new_req = Req(
+            rid=req_old.rid,
+            origin_input_text=origin_input_text,
+            origin_input_ids=origin_input_ids,
+            sampling_params=waiting_req.sampling_params.derive_sampling_params(),
+            eos_token_ids=scheduler.model_config.hf_eos_token_id,
+            return_hidden_states=False,
+            vocab_size=scheduler.model_config.vocab_size,
+            status="need",
+            last_cached_loc=req_old.last_cached_loc,
+        )
+        new_req.req_pool_idx = req_old.req_pool_idx
+        if not hasattr(new_req, "device"):
+            new_req.device = scheduler.batch_not_need.device
+        scheduler.waiting_queue.append(new_req)
+
+    @staticmethod
     def process_result_from_slm(scheduler: Scheduler, commit_msgs):
         new_token_ids = {}
-        reference_logits_mode = {}
-        reference_topk_k = {}
-        reference_decision_mode = {}
-        reference_js_threshold = {}
-        quick_logits = {}
-        quick_token_ids = {}
-        quick_topk_indices = {}
-        quick_topk_logits = {}
-        use_reference_output = {}
         returned_rid_list = []
         finished_rid_list = set()
+        retract_prefill_rids = set()
         if scheduler.batch_not_need is not None:
             req_already_prefilled = [req.rid for req in scheduler.batch_not_need.reqs]
         else:
             req_already_prefilled = []
         for waiting_req in commit_msgs:
+            if getattr(waiting_req, "status", "need") == "EVJS_CONTINUE":
+                LLMServer._evjs_handle_continue(scheduler, waiting_req)
+                continue
+            if getattr(waiting_req, "status", "need") == "RETRACT_AND_PREFILL":
+                retract_prefill_rids.add(waiting_req.rid)
+                LLMServer._retract_rid_from_batch_not_need(scheduler, waiting_req.rid)
+                if scheduler.batch_not_need is not None:
+                    req_already_prefilled = [req.rid for req in scheduler.batch_not_need.reqs]
+                else:
+                    req_already_prefilled = []
             new_token_ids[waiting_req.rid] = waiting_req.new_token_ids
-            reference_logits_mode[waiting_req.rid] = waiting_req.reference_logits_mode
-            reference_topk_k[waiting_req.rid] = waiting_req.reference_topk_k
-            reference_decision_mode[waiting_req.rid] = waiting_req.reference_decision_mode
-            reference_js_threshold[waiting_req.rid] = waiting_req.reference_js_threshold
-            quick_logits[waiting_req.rid] = waiting_req.quick_logits
-            quick_token_ids[waiting_req.rid] = waiting_req.quick_token_id
-            quick_topk_indices[waiting_req.rid] = waiting_req.quick_topk_indices
-            quick_topk_logits[waiting_req.rid] = waiting_req.quick_topk_logits
-            use_reference_output[waiting_req.rid] = waiting_req.use_reference_output
             returned_rid_list.append(waiting_req.rid)
             if waiting_req.status == "finished":
                 finished_rid_list.add(waiting_req.rid)
                 scheduler.n_active_reqs -= 1
                 continue
-            elif waiting_req.status == "new":
+            if waiting_req.rid not in req_already_prefilled:
                 scheduler.n_active_reqs += 1
-                continue
-            if waiting_req.rid not in req_already_prefilled:       
                 origin_input_ids = waiting_req.new_token_ids
                 origin_input_text = scheduler.tokenizer.decode(origin_input_ids)
                 new_req = Req(
@@ -342,24 +812,23 @@ class LLMServer:
                 )
                 if not hasattr(new_req, 'device'):
                     new_req.device = scheduler.batch_not_need.device
-                new_req.r2r_reference_logits_mode = reference_logits_mode.get(waiting_req.rid)
-                new_req.r2r_reference_topk_k = reference_topk_k.get(waiting_req.rid)
-                new_req.r2r_reference_decision_mode = reference_decision_mode.get(waiting_req.rid)
-                new_req.r2r_reference_js_threshold = reference_js_threshold.get(waiting_req.rid)
-                new_req.r2r_quick_logits = quick_logits.get(waiting_req.rid)
-                new_req.r2r_quick_token_id = quick_token_ids.get(waiting_req.rid)
-                new_req.r2r_quick_topk_indices = quick_topk_indices.get(waiting_req.rid)
-                new_req.r2r_quick_topk_logits = quick_topk_logits.get(waiting_req.rid)
-                new_req.r2r_use_reference_output = use_reference_output.get(
-                    waiting_req.rid, True
-                )
                 scheduler.waiting_queue.append(new_req)
 
         if scheduler.batch_not_need is not None:
             not_keep_indices = []
             for i, req in enumerate(scheduler.batch_not_need.reqs):
                 if req.rid in finished_rid_list:
-                    scheduler.tree_cache.cache_finished_req(req)
+                    # RadixCache assumes last_node is set; hybrid paths can finish without it.
+                    if getattr(req, "last_node", None) is not None:
+                        scheduler.tree_cache.cache_finished_req(req)
+                    continue
+                if req.rid in retract_prefill_rids:
+                    if getattr(req, "last_node", None) is not None:
+                        try:
+                            scheduler.tree_cache.cache_finished_req(req)
+                        except Exception:
+                            pass
+                    # Same as an in-place update: drop this slot from batch_not_need (do not append i to keep list).
                     continue
                 if req.rid in returned_rid_list:
                     origin_input_ids = req.origin_input_ids+new_token_ids[req.rid]
@@ -376,33 +845,6 @@ class LLMServer:
                     new_req.req_pool_idx = req.req_pool_idx
                     if not hasattr(new_req, 'device'):
                         new_req.device = scheduler.batch_not_need.device
-                    new_req.r2r_reference_logits_mode = reference_logits_mode.get(
-                        req.rid, getattr(req, "r2r_reference_logits_mode", None)
-                    )
-                    new_req.r2r_reference_topk_k = reference_topk_k.get(
-                        req.rid, getattr(req, "r2r_reference_topk_k", None)
-                    )
-                    new_req.r2r_reference_decision_mode = reference_decision_mode.get(
-                        req.rid, getattr(req, "r2r_reference_decision_mode", None)
-                    )
-                    new_req.r2r_reference_js_threshold = reference_js_threshold.get(
-                        req.rid, getattr(req, "r2r_reference_js_threshold", None)
-                    )
-                    new_req.r2r_quick_logits = quick_logits.get(
-                        req.rid, getattr(req, "r2r_quick_logits", None)
-                    )
-                    new_req.r2r_quick_token_id = quick_token_ids.get(
-                        req.rid, getattr(req, "r2r_quick_token_id", None)
-                    )
-                    new_req.r2r_quick_topk_indices = quick_topk_indices.get(
-                        req.rid, getattr(req, "r2r_quick_topk_indices", None)
-                    )
-                    new_req.r2r_quick_topk_logits = quick_topk_logits.get(
-                        req.rid, getattr(req, "r2r_quick_topk_logits", None)
-                    )
-                    new_req.r2r_use_reference_output = use_reference_output.get(
-                        req.rid, getattr(req, "r2r_use_reference_output", True)
-                    )
                     scheduler.waiting_queue.append(new_req)
                 else:
                     not_keep_indices.append(i)
@@ -604,104 +1046,11 @@ class LLMServer:
     def process_batch_results(rank: int, batch: ScheduleBatch, result, scheduler: Scheduler, outbound_queue: Optional[mp.Queue] = None):
         batch.output_ids = result.next_token_ids
         next_token_ids = result.next_token_ids.tolist()
-        reference_logits = result.logits_output.next_token_logits
         req_to_send = []
 
-        for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+        for req, next_token_id in zip(batch.reqs, next_token_ids):
             req.status = "notneed"
-            logits_mode = getattr(req, "r2r_reference_logits_mode", None)
-            topk_k = getattr(req, "r2r_reference_topk_k", None)
-            decision_mode = getattr(req, "r2r_reference_decision_mode", None)
-            quick_token_id = getattr(req, "r2r_quick_token_id", None)
-            use_reference_output = bool(getattr(req, "r2r_use_reference_output", True))
-            waiting_req_kwargs = {
-                "reference_logits_mode": logits_mode,
-                "reference_topk_k": topk_k,
-                "reference_decision_mode": decision_mode,
-            }
-            reference_token_id = int(next_token_id)
-            final_token_id = reference_token_id
-            final_token_source = "reference"
-            if not use_reference_output and quick_token_id is not None:
-                final_token_id = int(quick_token_id)
-                final_token_source = "quick"
-            waiting_req_kwargs["reference_token_id"] = reference_token_id
-            waiting_req_kwargs["reference_entropy"] = float(
-                compute_entropy(reference_logits[i].detach().cpu())
-            )
-            waiting_req_kwargs["reference_top1_prob"] = _get_top1_prob(reference_logits[i])
-
-            if logits_mode == "full":
-                if decision_mode == "llm_full_js":
-                    quick_logits = getattr(req, "r2r_quick_logits", None)
-                    js_threshold = getattr(req, "r2r_reference_js_threshold", None)
-
-                    if (
-                        quick_logits is not None
-                        and quick_token_id is not None
-                        and js_threshold is not None
-                    ):
-                        js_divergence = float(
-                            compute_js_divergence(
-                                quick_logits[None, :],
-                                reference_logits[i].detach().cpu()[None, :],
-                            )[0].item()
-                        )
-                        use_reference = (
-                            js_divergence >= float(js_threshold)
-                        )
-                        waiting_req_kwargs["js_divergence"] = js_divergence
-                        if not use_reference:
-                            final_token_id = int(quick_token_id)
-                            final_token_source = "quick"
-                else:
-                    waiting_req_kwargs["reference_logits"] = reference_logits[i].detach().cpu()
-            elif logits_mode == "topk":
-                topk_logits, topk_indices = extract_topk_logits(
-                    reference_logits[i],
-                    topk_k or 64,
-                )
-                if decision_mode in {"llm_sparse_js", "async_llm_sparse_js"}:
-                    quick_topk_indices = getattr(req, "r2r_quick_topk_indices", None)
-                    quick_topk_logits = getattr(req, "r2r_quick_topk_logits", None)
-                    js_threshold = getattr(req, "r2r_reference_js_threshold", None)
-
-                    if (
-                        quick_token_id is not None
-                        and quick_topk_indices is not None
-                        and quick_topk_logits is not None
-                        and js_threshold is not None
-                    ):
-                        js_divergence = float(
-                            compute_sparse_topk_js_divergence(
-                                logits_p=quick_topk_logits[None, :],
-                                indices_p=quick_topk_indices[None, :],
-                                logits_q=topk_logits.detach().cpu()[None, :],
-                                indices_q=topk_indices.detach().cpu()[None, :],
-                            )[0].item()
-                        )
-                        use_reference = (
-                            js_divergence >= float(js_threshold)
-                        )
-                        waiting_req_kwargs["js_divergence"] = js_divergence
-                        if not use_reference:
-                            final_token_id = int(quick_token_id)
-                            final_token_source = "quick"
-                    waiting_req_kwargs["async_speculative"] = (
-                        decision_mode == "async_llm_sparse_js"
-                    )
-                else:
-                    waiting_req_kwargs["reference_topk_logits"] = topk_logits.detach().cpu()
-                    waiting_req_kwargs["reference_topk_indices"] = topk_indices.detach().cpu()
-
-            waiting_req_kwargs["final_token_source"] = final_token_source
-
-            waiting_req = WaitingReq(
-                rid=req.rid,
-                new_token_ids=[final_token_id],
-                sampling_params=None,
-                **waiting_req_kwargs,
-            )
+            waiting_req = WaitingReq(rid=req.rid,new_token_ids=[next_token_id],sampling_params=None)
             req_to_send.append(waiting_req)
         if rank == 0:
             try:
@@ -715,12 +1064,11 @@ class LLMServer:
     
     @staticmethod
     def simple_prepare_for_extend(batch: ScheduleBatch):
-        global end_of_cache_loc
         batch.forward_mode = ForwardMode.EXTEND
 
-        # Allocate req slots
+        # Allocate req slots (must be pool indices from allocator, not req.rid — rids can be str)
         bs = len(batch.reqs)
-        req_pool_indices = [req.rid for req in batch.reqs]
+        req_pool_indices = batch.alloc_req_slots(bs)
 
         # Init tensors
         reqs = batch.reqs
@@ -748,24 +1096,22 @@ class LLMServer:
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
             req.is_retracted = False
-        # Allocate memory for multiple sequences
-        out_cache_locs = []
-        for i in range(bs):
-            start = end_of_cache_loc
-            end_of_cache_loc += extend_lens[i]
-            end = start + extend_lens[i]
-            out_cache_loc = torch.arange(
-                start=start,
-                end=end,
-                dtype=torch.int64,
-                device=batch.device,
-            )
-            out_cache_locs.append(out_cache_loc)
-        
-        if len(out_cache_locs) == 0:
+        if extend_num_tokens == 0:
             out_cache_loc = None
+        elif batch.token_to_kv_pool_allocator.page_size == 1:
+            out_cache_loc = batch.alloc_token_slots(extend_num_tokens)
         else:
-            out_cache_loc = torch.cat(out_cache_locs) if len(out_cache_locs) > 1 else out_cache_locs[0]
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                req_pool_indices_tensor,
+                prefix_lens_tensor,
+            )
+            out_cache_loc = batch.alloc_paged_token_slots_extend(
+                prefix_lens_tensor,
+                seq_lens_tensor,
+                last_loc,
+                extend_num_tokens,
+            )
 
         # Set fields
         batch.input_ids = input_ids_tensor

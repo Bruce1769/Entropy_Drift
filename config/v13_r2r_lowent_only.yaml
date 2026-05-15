@@ -1,0 +1,6 @@
+{
+  "special_tokens": {"think_start": 151648, "think_end": 151649},
+  "quick": {"model_name": "DeepSeek-R1-Distill-Qwen-1.5B", "model_path": "/root/autodl-tmp/DeepSeek-R1-Distill-Qwen-1.5B", "param": "1.5", "mem_fraction_static": 0.15},
+  "reference": {"model_name": "DeepSeek-R1-Distill-Qwen-32B", "model_path": "/root/autodl-tmp/DeepSeek-R1-Distill-Qwen-32B", "param": "32", "mem_fraction_static": 0.8},
+  "router": {"router_name": "multitask_js_router", "switching_strategy": "multitask_js_router", "router_path": "/root/autodl-tmp/datasets/router_multitask_js_runs/run_v13_r2r_lowent_only/best.pt", "threshold": 0.843, "entropy_threshold": 0.6, "entropy_topk_k": 100, "pretrained_model_name": "/root/autodl-tmp/DeepSeek-R1-Distill-Qwen-1.5B"}
+}

@@ -55,18 +55,18 @@ def get_mem_fraction_statics(
     reference_num_gpus: int = 1
 ) -> Tuple[float, float]:
     if not overlap_tp_schedule:
-        quick_mem_fraction_static = float(
-            model_config.get("quick", {}).get("mem_fraction_static", 0.9)
-        )
-        reference_mem_fraction_static = float(
-            model_config.get("reference", {}).get("mem_fraction_static", 0.9)
-        )
+        # Honor model YAML (was incorrectly hard-coded 0.9 for both). Entropy lookahead
+        # runs many LLM one-off forwards; reference needs headroom below 0.9 on 24GB cards.
+        qcfg = model_config.get("quick") or {}
+        rcfg = model_config.get("reference") or {}
+        q_mem = float(qcfg.get("mem_fraction_static", 0.9))
+        r_mem = float(rcfg.get("mem_fraction_static", 0.9))
+        r_mem = float(os.environ.get("R2R_REFERENCE_MEM_FRACTION", r_mem))
         print(
-            "[SLDisaggregationSystem] overlap_tp_schedule=False, using configured "
-            f"mem_fraction_static: quick model {quick_mem_fraction_static:.2f}, "
-            f"reference model {reference_mem_fraction_static:.2f}"
+            f"[SLDisaggregationSystem] mem_fraction_static (from config): "
+            f"quick={q_mem}, reference={r_mem}"
         )
-        return quick_mem_fraction_static, reference_mem_fraction_static
+        return q_mem, r_mem
 
     small_server_args = ServerArgs(
         model_path=model_config["quick"]["model_path"],
@@ -140,7 +140,6 @@ class SLDisaggregationSystem:
         reference_sglang_kwargs: Optional[dict] = None,
         is_logits_processor: bool = True,
         overlap_tp_schedule: bool = False,
-        slm_min_batch_size: Union[int, list[int]] = 1,
         llm_min_batch_size: Union[int, list[int]] = 1,
         trace_reference_topk_k: int = 64,
         trace_reference_for_all_positions: bool = False,
@@ -175,7 +174,7 @@ class SLDisaggregationSystem:
         self.strategy_kwargs = strategy_kwargs or {}
         self.switching_strategy = switching_strategy
         self.is_record = is_record
-        self.trace_reference_topk_k = trace_reference_topk_k
+        self.trace_reference_topk_k = int(trace_reference_topk_k)
         self.trace_reference_for_all_positions = bool(trace_reference_for_all_positions)
         self.trace_logits_topk_k = int(trace_logits_topk_k)
         self.rid = 1
@@ -213,8 +212,6 @@ class SLDisaggregationSystem:
         # Compute MASTER_PORT once in the main process and pass to workers
         self.slm_master_port = find_free_port()
         print(f"[SLDisaggregationSystem] SLM MASTER_ADDR: localhost, MASTER_PORT: {self.slm_master_port}")
-        self.slm_startup_timeout = int(os.environ.get("R2R_SLM_STARTUP_TIMEOUT_SEC", "300"))
-        self.llm_startup_timeout = int(os.environ.get("R2R_LLM_STARTUP_TIMEOUT_SEC", "300"))
 
         small_mem_fraction_static, large_mem_fraction_static = get_mem_fraction_statics(
             model_config=self.model_config,
@@ -236,6 +233,22 @@ class SLDisaggregationSystem:
         """
         self.llm_kvcache_size = Value('i', 0)
 
+        if switching_strategy in (
+            "entropy_lookahead",
+            "sliding_window_entropy_js",
+            "entropy_variance_js",
+        ):
+            if self.quick_num_gpus != 1 or self.reference_num_gpus != 1:
+                raise ValueError(
+                    f"switching_strategy={switching_strategy!r} requires SLM tp_size=1 and LLM tp_size=1 "
+                    f"(got quick_num_gpus={self.quick_num_gpus}, reference_num_gpus={self.reference_num_gpus})"
+                )
+            self._entropy_lookahead_query_queue: mp.Queue = mp.Queue()
+            self._entropy_lookahead_reply_queue: mp.Queue = mp.Queue()
+        else:
+            self._entropy_lookahead_query_queue = None
+            self._entropy_lookahead_reply_queue = None
+
         # Launch quick model workers with req_port(port that receive Req objects)
         # Inter-server queues (Q2): create before servers so workers can use them
         # Instantiate SLMServer first (it binds its PUB for SLM->LLM)
@@ -249,23 +262,17 @@ class SLDisaggregationSystem:
             strategy_kwargs=self.strategy_kwargs,
             mem_fraction_static=small_mem_fraction_static,
             llm_kvcache_size=self.llm_kvcache_size,
-            min_batch_size=slm_min_batch_size,
             master_port=self.slm_master_port,  # Pass master_port to SLMServer
-            is_record=self.is_record,
-            trace_reference_topk_k=self.trace_reference_topk_k,
-            trace_reference_for_all_positions=self.trace_reference_for_all_positions,
-            trace_logits_topk_k=self.trace_logits_topk_k,
+            entropy_lookahead_query_queue=self._entropy_lookahead_query_queue,
+            entropy_lookahead_reply_queue=self._entropy_lookahead_reply_queue,
         )
 
         try:
             got = 0
             tok = None
+            slm_startup_timeout = int(os.environ.get("R2R_SLM_STARTUP_TIMEOUT", "900"))
             while got < self.quick_num_gpus:
-                msg, rank, payload = self._quick_ready_queue.get(timeout=self.slm_startup_timeout)
-                if msg == "ERROR":
-                    raise RuntimeError(
-                        f"SLM worker rank {rank} failed during startup:\n{payload}"
-                    )
+                msg, rank, payload = self._quick_ready_queue.get(timeout=slm_startup_timeout)
                 if msg != "READY":
                     raise RuntimeError(f"unexpected ready msg: {msg}")
                 if tok is None and payload is not None:
@@ -274,10 +281,7 @@ class SLDisaggregationSystem:
             assert tok is not None, "Failed to get tokenizer from quick model scheduler"
             self.tokenizer = tok
         except Exception as e:
-            raise RuntimeError(
-                "Waiting for SLMServer launching or failed to get tokenizer from scheduler "
-                f"within {self.slm_startup_timeout}s"
-            ) from e
+            raise RuntimeError("Waiting for SLMServer launching or Failed to get tokenizer from scheduler") from e
 
 
         # Launch reference model workers
@@ -293,24 +297,23 @@ class SLDisaggregationSystem:
             mem_fraction_static=large_mem_fraction_static,
             llm_kvcache_size=self.llm_kvcache_size,
             min_batch_size=llm_min_batch_size,
+            entropy_lookahead_query_queue=self._entropy_lookahead_query_queue,
+            entropy_lookahead_reply_queue=self._entropy_lookahead_reply_queue,
         )
 
         try:
             # Wait LLM workers
             got_llm = 0
             ref_tok = None
+            llm_startup_timeout = int(os.environ.get("R2R_LLM_STARTUP_TIMEOUT", "900"))
             while got_llm < self.reference_num_gpus:
-                ready_msg = self._llm_ready_queue.get(timeout=self.llm_startup_timeout)
+                ready_msg = self._llm_ready_queue.get(timeout=llm_startup_timeout)
                 # Compatible with formats: (msg, rank) or (msg, rank, tokenizer)
                 if len(ready_msg) == 2:
                     msg, rank = ready_msg
                     tk = None
                 else:
                     msg, rank, tk = ready_msg
-                if msg == "ERROR":
-                    raise RuntimeError(
-                        f"Reference worker rank {rank} failed during startup:\n{tk}"
-                    )
                 if msg != "READY":
                     raise RuntimeError(f"unexpected llm ready msg: {msg}")
                 if ref_tok is None and tk is not None:
@@ -322,10 +325,7 @@ class SLDisaggregationSystem:
             self._llm_all_ready = True
             print(f"[SLDisaggregationSystem] llm READY={got_llm}")
         except Exception as e:
-            raise RuntimeError(
-                "Waiting for reference model workers launching failed "
-                f"within {self.llm_startup_timeout}s"
-            ) from e
+            raise RuntimeError("Waiting for reference model workers launching failed") from e
 
         if self.tokenizer is None:
             self.tokenizer = self.reference_tokenizer
@@ -421,17 +421,27 @@ class SLDisaggregationSystem:
         pass
 
     def warm_up_quick_model(self):
+        # Warmup uses rid "0" and the same switching strategy as eval. For entropy_*_js,
+        # that can trigger SLM<->LLM RPC every step and block the worker for a long time;
+        # real eval requests (rid>=1) then wait on finished_reqs with pending_rids=['1'].
+        if self.switching_strategy in ("entropy_lookahead", "entropy_variance_js", "sliding_window_entropy_js"):
+            if os.environ.get("R2R_FORCE_WARMUP", "0") != "1":
+                print(
+                    f"[SLDisaggregationSystem] skipping warm_up_quick_model for strategy={self.switching_strategy!r} "
+                    "(set R2R_FORCE_WARMUP=1 to force warmup)"
+                )
+                return
+        if os.environ.get("R2R_SKIP_WARMUP", "0") == "1":
+            print("[SLDisaggregationSystem] R2R_SKIP_WARMUP=1, skipping warm_up_quick_model")
+            return
         # dummy call to warm up the quick model
         warmup_iter = 5
         input_text = ["Hi"]
         input_ids = [self.tokenizer.encode(text) for text in input_text]
         quick_sampling_params = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_new_tokens=warmup_iter, stop=[])
-        warmup_rids = []
         for i, (text, input_id) in enumerate(zip(input_text, input_ids)):
-            rid = str(i)
-            warmup_rids.append(rid)
             req = Req(
-                rid=rid,
+                rid=str(i),
                 origin_input_text=text,
                 origin_input_ids=input_id,
                 sampling_params=quick_sampling_params,
@@ -444,21 +454,8 @@ class SLDisaggregationSystem:
             except zmq.Again:
                 time.sleep(0.01)
                 self.req_sender.send_pyobj(req)
-
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            if all(rid in self.finished_reqs for rid in warmup_rids):
-                break
-            time.sleep(0.1)
-        else:
-            print("[SLDisaggregationSystem] Warning: quick-model warmup did not finish within 120s")
-
-        for rid in warmup_rids:
-            self.finished_reqs.pop(rid, None)
-            try:
-                self.finished_reqs_rids.remove(rid)
-            except ValueError:
-                pass
+        
+        time.sleep(5)
     
     def get_rid(self):
         with self.rid_lock:
@@ -533,11 +530,6 @@ class SLDisaggregationSystem:
                 status="need",
             )
             req.display_progress = display_progress
-            req.r2r_trace_reference_topk_k = int(self.trace_reference_topk_k) if self.is_record else 0
-            req.r2r_trace_reference_for_all_positions = (
-                bool(self.trace_reference_for_all_positions) if self.is_record else False
-            )
-            req.r2r_trace_logits_topk_k = int(self.trace_logits_topk_k) if self.is_record else 0
             # Send Req object to worker process via ZMQ
             try:
                 self.req_sender.send_pyobj(req, flags=zmq.NOBLOCK)
@@ -547,6 +539,10 @@ class SLDisaggregationSystem:
                 self.req_sender.send_pyobj(req)
         # Wait until all rids appear in finished map
         results = []
+        wait_start = time.monotonic()
+        wait_log_every_s = float(os.environ.get("R2R_WAIT_LOG_EVERY_S", "15"))
+        wait_timeout_s = float(os.environ.get("R2R_GENERATE_TIMEOUT_S", "900"))
+        next_wait_log_at = wait_start + wait_log_every_s
         while True:
             all_done = all(rid in self.finished_reqs for rid in rids)
             if all_done:
@@ -566,6 +562,21 @@ class SLDisaggregationSystem:
                         #print("===")
                         results.append(obj)
                 break
+            now = time.monotonic()
+            if now >= next_wait_log_at:
+                pending = [rid for rid in rids if rid not in self.finished_reqs]
+                print(
+                    f"[SLDisaggregationSystem] waiting finished reqs: pending={len(pending)}/{len(rids)} "
+                    f"elapsed={now - wait_start:.1f}s, pending_rids={pending[:8]}",
+                    flush=True,
+                )
+                next_wait_log_at = now + wait_log_every_s
+            if wait_timeout_s > 0 and (now - wait_start) > wait_timeout_s:
+                pending = [rid for rid in rids if rid not in self.finished_reqs]
+                raise TimeoutError(
+                    f"generate() timeout after {wait_timeout_s:.1f}s; "
+                    f"pending {len(pending)}/{len(rids)} requests: {pending[:16]}"
+                )
             time.sleep(0.1)
 
         return results
@@ -697,20 +708,38 @@ class SLDisaggregationSystem:
 
         # Stop finished-req SUB thread and close socket
         try:
-            self._finished_recv_stop.set() # Set Event
-            # ...existing code...
+            if hasattr(self, "_finished_recv_stop") and self._finished_recv_stop is not None:
+                self._finished_recv_stop.set()
+        except Exception:
+            pass
+        try:
+            if (
+                hasattr(self, "_finished_recv_thread")
+                and self._finished_recv_thread is not None
+                and self._finished_recv_thread.is_alive()
+            ):
+                self._finished_recv_thread.join(timeout=2)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_finished_sub") and self._finished_sub is not None:
+                self._finished_sub.close(linger=0)
+                self._finished_sub = None
         except Exception:
             pass
         try:
             if hasattr(self, "req_sender") and self.req_sender is not None:
                 self.req_sender.close(linger=0)
+                self.req_sender = None
         except Exception:
             pass
         
         # Destroy ZMQ context to release sockets
         try:
             if hasattr(self, "zmq_ctx") and self.zmq_ctx is not None:
-                self.zmq_ctx.term()
+                # destroy(linger=0) avoids blocking if any background socket was not closed in time.
+                self.zmq_ctx.destroy(linger=0)
+                self.zmq_ctx = None
         except Exception:
             pass
 

@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from typing import Tuple, Union
+from typing import List, Tuple, Union
 
 def compute_entropy(logits: torch.Tensor) -> Union[float, torch.Tensor]:
     """
@@ -22,6 +22,95 @@ def compute_entropy(logits: torch.Tensor) -> Union[float, torch.Tensor]:
     entropy = -torch.sum(probs * log_probs, dim=-1)  # [batch_size]
     
     return entropy.item() if is_single_input else entropy
+
+
+def compute_variance(logits: torch.Tensor) -> Union[float, torch.Tensor]:
+    """Variance of the softmax probability mass (per row). Low variance ≈ flat distribution."""
+    is_single_input = logits.dim() == 1
+    if is_single_input:
+        logits = logits.unsqueeze(0)
+
+    probs = F.softmax(logits, dim=-1)
+    mean_probs = probs.mean(dim=-1, keepdim=True)
+    variance = ((probs - mean_probs) ** 2).mean(dim=-1)
+
+    return variance.item() if is_single_input else variance
+
+
+def compute_js_divergence_logits(
+    logits_p: torch.Tensor,
+    logits_q: torch.Tensor,
+    eps: float = 1e-12,
+) -> float:
+    """Symmetric Jensen–Shannon divergence JS(P, Q) with P,Q = softmax(logits)."""
+    if logits_p.dim() == 1:
+        logits_p = logits_p.unsqueeze(0)
+    if logits_q.dim() == 1:
+        logits_q = logits_q.unsqueeze(0)
+    p = F.softmax(logits_p.float(), dim=-1)
+    q = F.softmax(logits_q.float(), dim=-1)
+    m = 0.5 * (p + q)
+    log_p = torch.log(p + eps)
+    log_q = torch.log(q + eps)
+    log_m = torch.log(m + eps)
+    kl_pm = (p * (log_p - log_m)).sum(dim=-1)
+    kl_qm = (q * (log_q - log_m)).sum(dim=-1)
+    return float((0.5 * (kl_pm + kl_qm)).item())
+
+
+def compute_js_divergence_topk_union(
+    logits_p: torch.Tensor,
+    q_topk_indices: List[int],
+    q_topk_probs: List[float],
+    q_tail_mass: float,
+    top_k: int = 16,
+    eps: float = 1e-12,
+) -> float:
+    """Approximate JS(P, Q) on union(topk(P), topk(Q)) + one tail bucket."""
+    if logits_p.dim() == 2:
+        logits_p = logits_p.squeeze(0)
+    p = F.softmax(logits_p.float(), dim=-1)
+    vocab = int(p.numel())
+    k = max(1, min(int(top_k), vocab))
+    p_topk_idx = torch.topk(p, k=k, dim=-1).indices.tolist()
+
+    q_map: dict = {}
+    for idx, prob in zip(q_topk_indices, q_topk_probs):
+        ii = int(idx)
+        if 0 <= ii < vocab:
+            q_map[ii] = q_map.get(ii, 0.0) + float(prob)
+
+    support = sorted(set(int(x) for x in p_topk_idx) | set(q_map.keys()))
+    if not support:
+        return 0.0
+
+    support_tensor = torch.as_tensor(support, dtype=torch.long, device=p.device)
+    p_core = p.index_select(0, support_tensor)
+    q_core = torch.as_tensor(
+        [q_map.get(int(i), 0.0) for i in support], dtype=torch.float32, device=p.device
+    )
+
+    p_tail = torch.clamp(1.0 - p_core.sum(), min=0.0)
+    q_tail = torch.as_tensor(max(0.0, float(q_tail_mass)), dtype=torch.float32, device=p.device)
+
+    p_approx = torch.cat([p_core, p_tail.unsqueeze(0)], dim=0)
+    q_approx = torch.cat([q_core, q_tail.unsqueeze(0)], dim=0)
+
+    p_approx = p_approx / torch.clamp(p_approx.sum(), min=eps)
+    q_approx = q_approx / torch.clamp(q_approx.sum(), min=eps)
+
+    m = 0.5 * (p_approx + q_approx)
+    kl_pm = (p_approx * (torch.log(p_approx + eps) - torch.log(m + eps))).sum()
+    kl_qm = (q_approx * (torch.log(q_approx + eps) - torch.log(m + eps))).sum()
+    return float((0.5 * (kl_pm + kl_qm)).item())
+
+
+def log_prob_of_token(logits: torch.Tensor, token_id: int) -> float:
+    """log softmax probability of a single token id. logits: [vocab] or [1, vocab]."""
+    if logits.dim() == 2:
+        logits = logits.squeeze(0)
+    return F.log_softmax(logits, dim=-1)[token_id].item()
+
 
 def compute_topk_entropy(
     logits: torch.Tensor, topk: int

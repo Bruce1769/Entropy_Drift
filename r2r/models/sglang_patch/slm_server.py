@@ -1,6 +1,7 @@
 import uuid
 import torch
 import time
+from collections import deque
 import zmq
 import pickle
 from tqdm import tqdm
@@ -13,12 +14,19 @@ import os
 import threading
 import queue
 import sys
-import traceback
+import json
 from multiprocessing import Value
 import nvtx
 
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch, ForwardMode, SamplingBatchInfo, write_req_to_token_pool_triton
+from sglang.srt.managers.schedule_batch import (
+    Req,
+    ScheduleBatch,
+    ForwardMode,
+    SamplingBatchInfo,
+    get_last_loc,
+    write_req_to_token_pool_triton,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.managers.io_struct import AbortReq
@@ -30,55 +38,204 @@ from r2r.utils.config import (
     REFERENCE_COLOR,
     RESET,
 )
-from r2r.utils.switching import create_switching_strategy
+from r2r.utils.switching import (
+    _leftmost_argmax_index,
+    append_entropy_lookahead_score_log,
+    create_switching_strategy,
+    EntropyLookaheadSwitching,
+    EntropyVarianceJsSwitching,
+    SlidingWindowEntropyJsSwitching,
+    SlidingWindowEntropySwitching,
+)
 from r2r.utils.token_manager import SGLangTokenManager
 from r2r.utils.dataclass import ModelOutputs
 from r2r.utils.sampling import sample_token
 from r2r.utils.metrics import (
     compute_entropy,
-    compute_js_divergence,
-    compute_sparse_topk_js_divergence,
-    extract_topk_logits,
+    compute_js_divergence_logits,
+    compute_js_divergence_topk_union,
+    log_prob_of_token,
 )
-from r2r.models.sglang_patch.schedule_req import WaitingReq, SimpleSamplingParams
+from r2r.models.sglang_patch.schedule_req import (
+    WaitingReq,
+    SimpleSamplingParams,
+    EntropyLookaheadRpc,
+    EntropyLookaheadResp,
+    NextTokenJsRpc,
+    NextTokenJsAbortRpc,
+    NextTokenJsResp,
+    SlidingWindowJsRpc,
+    SlidingWindowJsResp,
+)
 
-def _get_router_score(router, index: int) -> Optional[float]:
-    scores = getattr(router, "last_route_scores", None)
-    if scores is None:
-        return None
+_el_rpc_fail_last_log = 0.0
+_el_rpc_fail_pending = 0
+
+_AGENT_DEBUG_LOG_PATH = "/remote-home/pxl/.cursor/debug-7a73bd.log"
+_AGENT_DEBUG_SESSION_ID = "7a73bd"
+
+
+def _agent_debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
     try:
-        return float(scores[index].item())
+        payload = {
+            "sessionId": _AGENT_DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
     except Exception:
-        try:
-            return float(scores[index])
-        except Exception:
-            return None
+        pass
 
-def _get_top1_prob(logits: torch.Tensor) -> float:
-    probs = torch.softmax(logits.to(dtype=torch.float32), dim=-1)
-    return float(torch.max(probs).item())
 
-def _ensure_trace(req: Req) -> List[Dict]:
-    if not hasattr(req, "r2r_token_trace"):
-        req.r2r_token_trace = []
-    return req.r2r_token_trace
-
-def _append_trace_entry(req: Req, entry: Dict) -> int:
-    trace = _ensure_trace(req)
-    trace.append(entry)
-    return len(trace) - 1
-
-def _update_trace_entry(req: Req, trace_index: Optional[int], updates: Dict) -> None:
-    if trace_index is None:
+def _log_entropy_lookahead_rpc_fail_throttled(err: object, seq_i: int) -> None:
+    """Avoid MB-sized logs when LLM OOMs every token."""
+    global _el_rpc_fail_last_log, _el_rpc_fail_pending
+    now = time.monotonic()
+    _el_rpc_fail_pending += 1
+    elapsed = now - _el_rpc_fail_last_log
+    if _el_rpc_fail_last_log != 0.0 and elapsed < 15.0:
         return
-    trace = getattr(req, "r2r_token_trace", None)
-    if not trace or trace_index >= len(trace):
+    es = str(err).replace("\n", " ")[:180]
+    print(
+        f"[SLMServer] entropy lookahead LLM logprob RPC failed x{_el_rpc_fail_pending} "
+        f"in ~{max(elapsed, 0.001):.1f}s, seq={seq_i}: {es}; falling back to entropy routing"
+    )
+    _el_rpc_fail_pending = 0
+    _el_rpc_fail_last_log = now
+
+
+def _tps_log_interval_s() -> float:
+    """Wall-clock spacing for throughput lines; override with R2R_TPS_LOG_INTERVAL (seconds, min 0.25)."""
+    try:
+        return max(0.25, float(os.environ.get("R2R_TPS_LOG_INTERVAL", "4.0")))
+    except ValueError:
+        return 4.0
+
+
+def _perf_probe_enabled() -> bool:
+    return os.environ.get("R2R_PERF_PROBE", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _log_entropy_sum_enabled() -> bool:
+    return os.environ.get("R2R_LOG_ENTROPY_SUM", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _maybe_log_entropy_sum(
+    req: Req,
+    entropy_path: list,
+    entropy_path_sum: float,
+    threshold: float,
+    triggered: bool,
+    window_full: bool = True,
+    *,
+    path_mean: Optional[float] = None,
+    threshold_mean: Optional[float] = None,
+) -> None:
+    """实时打印滑动窗口熵（每步 decode）；可用 R2R_ENTROPY_SUM_MIN_INTERVAL_S 限频。
+    When ``threshold_mean`` is set, trigger uses mean vs that threshold; log line includes mean."""
+    try:
+        min_iv = float(os.environ.get("R2R_ENTROPY_SUM_MIN_INTERVAL_S", "0"))
+    except ValueError:
+        min_iv = 0.0
+    min_iv = max(0.0, min_iv)
+    now = time.perf_counter()
+    last = getattr(req, "_r2r_entropy_sum_log_t", None)
+    if last is not None and (now - last) < min_iv:
         return
-    trace[trace_index].update(updates)
+    setattr(req, "_r2r_entropy_sum_log_t", now)
+    rid = getattr(req, "rid", "?")
+    path_s = "[" + ", ".join(f"{x:.3f}" for x in entropy_path) + "]"
+    full_tag = "full" if window_full else "partial"
+    if threshold_mean is not None and path_mean is not None:
+        print(
+            f"[entropy_window] rid={rid} {full_tag} path_mean={path_mean:.4f} thr_mean={threshold_mean:.4f} "
+            f"path_sum={entropy_path_sum:.4f} path={path_s} triggered={triggered}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[entropy_sum] rid={rid} {full_tag} path_sum={entropy_path_sum:.4f} thr={threshold} "
+            f"path={path_s} triggered={triggered}",
+            flush=True,
+        )
+
+
+def _log_current_tokens_per_second(
+    scheduler: Scheduler,
+    rank: int,
+    source: str,
+    token_count: int,
+    interval_s: Optional[float] = None,
+) -> None:
+    if interval_s is None:
+        interval_s = _tps_log_interval_s()
+    if rank != 0 or token_count <= 0:
+        return
+    now = time.perf_counter()
+    scheduler.current_tps_total_tokens = getattr(scheduler, "current_tps_total_tokens", 0) + int(token_count)
+    scheduler.current_tps_slm_tokens = getattr(scheduler, "current_tps_slm_tokens", 0)
+    scheduler.current_tps_llm_tokens = getattr(scheduler, "current_tps_llm_tokens", 0)
+    if source == "slm":
+        scheduler.current_tps_slm_tokens += int(token_count)
+    elif source == "llm":
+        scheduler.current_tps_llm_tokens += int(token_count)
+    last = getattr(scheduler, "current_tps_last_time", None)
+    if last is None:
+        scheduler.current_tps_last_time = now
+        return
+    elapsed = now - last
+    if elapsed < interval_s:
+        return
+    total = getattr(scheduler, "current_tps_total_tokens", 0)
+    slm = getattr(scheduler, "current_tps_slm_tokens", 0)
+    llm = getattr(scheduler, "current_tps_llm_tokens", 0)
+    tps = total / max(elapsed, 1e-6)
+    print(
+        f"[current tokens/s] total={tps:.2f} "
+        f"(slm_tokens={slm}, llm_tokens={llm}, window={elapsed:.1f}s)",
+        flush=True,
+    )
+    scheduler.current_tps_last_time = now
+    scheduler.current_tps_total_tokens = 0
+    scheduler.current_tps_slm_tokens = 0
+    scheduler.current_tps_llm_tokens = 0
 
 
 class SLMServer:
     """SLM Server launched by SGLang"""
+
+    @staticmethod
+    def tree_cache_finished_req_safe(scheduler: Scheduler, req: Req) -> None:
+        """Finish request KV lifecycle without crashing when ``req.last_node`` is None.
+
+        ``ChunkCache.match_prefix`` returns ``last_device_node=None``. Radix
+        ``cache_finished_req`` still calls ``dec_lock_ref(req.last_node)``, which
+        raises ``AttributeError`` if the node was never set.
+        """
+        tc = scheduler.tree_cache
+        if getattr(tc, "disable", False):
+            tc.cache_finished_req(req)
+            return
+        if getattr(req, "last_node", None) is None:
+            if req.req_pool_idx is None:
+                return
+            tok_len = len(req.origin_input_ids) + len(req.output_ids)
+            if tok_len <= 0:
+                scheduler.req_to_token_pool.free(req.req_pool_idx)
+                return
+            kv_indices = scheduler.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : tok_len - 1
+            ]
+            scheduler.token_to_kv_pool_allocator.free(kv_indices)
+            scheduler.req_to_token_pool.free(req.req_pool_idx)
+            return
+        tc.cache_finished_req(req)
+
     def __init__(
         self,
         model_config: Dict,
@@ -90,12 +247,9 @@ class SLMServer:
         strategy_kwargs: Dict = {},
         mem_fraction_static: Optional[float] = None,
         llm_kvcache_size: Optional[Value] = None,
-        min_batch_size: Union[int, list[int]] = 1,
         master_port: Optional[int] = None,
-        is_record: bool = False,
-        trace_reference_topk_k: int = 64,
-        trace_reference_for_all_positions: bool = False,
-        trace_logits_topk_k: int = 0,
+        entropy_lookahead_query_queue: Optional[mp.Queue] = None,
+        entropy_lookahead_reply_queue: Optional[mp.Queue] = None,
     ):
         self.quick_waiting_line = []
         self.is_reset_cache = False
@@ -110,10 +264,8 @@ class SLMServer:
         self.switching_strategy = switching_strategy
         self.strategy_kwargs = strategy_kwargs
         self.master_port = master_port
-        self.is_record = is_record
-        self.trace_reference_topk_k = trace_reference_topk_k
-        self.trace_reference_for_all_positions = bool(trace_reference_for_all_positions)
-        self.trace_logits_topk_k = int(trace_logits_topk_k)
+        self.entropy_lookahead_query_queue = entropy_lookahead_query_queue
+        self.entropy_lookahead_reply_queue = entropy_lookahead_reply_queue
         # Inter-server queues (outbound to LLM / inbound from LLM)
         self.queue_to_llm = mp.Queue()
         # Dedicated outbound sequence counter for messages sent to LLM
@@ -152,6 +304,16 @@ class SLMServer:
                     continue
                 try:
                     self._pub_finished.send_pyobj(item)
+                    if isinstance(item, dict) and item.get("status") == "finished":
+                        #region agent log
+                        _agent_debug_log(
+                            run_id=os.environ.get("R2R_DEBUG_RUN_ID", "run-unknown"),
+                            hypothesis_id="H2",
+                            location="slm_server.py:_send_finished_loop",
+                            message="published_finished_event",
+                            data={"rid": item.get("rid"), "status": item.get("status")},
+                        )
+                        #endregion
                 except Exception:
                     pass
         self._send_finished_thread = threading.Thread(target=_send_finished_loop, daemon=True)
@@ -211,13 +373,34 @@ class SLMServer:
         except Exception:
             pass
 
+        _quick_kw = dict(quick_sglang_kwargs or {})
+        _quick_kw.pop("disable_radix_cache", None)
+        # Blackwell-class GPUs can hit sgl_kernel RMSNorm failures during CUDA graph
+        # capture; allow env override and default to disabling graphs on sm_120+.
+        disable_quick_cuda_graph_env = os.environ.get("R2R_QUICK_DISABLE_CUDA_GRAPH")
+        if disable_quick_cuda_graph_env is None:
+            try:
+                disable_quick_cuda_graph = (
+                    torch.cuda.is_available()
+                    and torch.cuda.get_device_capability(0)[0] >= 12
+                )
+            except Exception:
+                disable_quick_cuda_graph = False
+        else:
+            disable_quick_cuda_graph = disable_quick_cuda_graph_env.strip().lower() not in (
+                "0",
+                "false",
+                "no",
+            )
         quick_server_args = ServerArgs(
             model_path=self.model_config["quick"]["model_path"],
-            disable_cuda_graph=False,
+            disable_cuda_graph=disable_quick_cuda_graph,
             disable_overlap_schedule=True,
-            disable_radix_cache=False,
+            # ChunkCache: avoids RadixCache.cache_finished_req + dec_lock_ref(req.last_node)
+            # when last_node is unset on hybrid/disagg finish paths.
+            disable_radix_cache=True,
             mem_fraction_static=mem_fraction_static,
-            **quick_sglang_kwargs,
+            **_quick_kw,
         )
         quick_server_args.tp_size = quick_num_gpus
         
@@ -241,10 +424,9 @@ class SLMServer:
                     self._finished_reqs_queue,  # finished reqs back to system
                     req_port if rank == 0 else None,  # system SUB only on rank 0
                     llm_kvcache_size,
-                    min_batch_size,
                     self.master_port,  # Pass master_port to worker
-                    self.trace_reference_for_all_positions,
-                    self.trace_logits_topk_k,
+                    self.entropy_lookahead_query_queue,
+                    self.entropy_lookahead_reply_queue,
                 ),
             )
             proc.start()
@@ -270,13 +452,6 @@ class SLMServer:
             req.eos_token_ids = scheduler.model_config.hf_eos_token_id
             req.vocab_size = scheduler.model_config.vocab_size
             scheduler.waiting_queue.append(req)
-            outbound_queue.put_nowait([WaitingReq(
-                rid=req.rid, 
-                new_token_ids=[], 
-                sampling_params=SimpleSamplingParams(),
-                status="new",
-            )])
-            scheduler.n_active_reqs += 1
         
         return True
 
@@ -293,69 +468,66 @@ class SLMServer:
         finished_queue: Optional[mp.Queue] = None,
         req_port: Optional[int] = None,
         llm_kvcache_size: Optional[Value] = None,
-        min_batch_size: Union[int, list[int]] = 1,
         master_port: Optional[int] = None,
-        trace_reference_for_all_positions: bool = False,
-        trace_logits_topk_k: int = 0,
+        entropy_lookahead_query_queue: Optional[mp.Queue] = None,
+        entropy_lookahead_reply_queue: Optional[mp.Queue] = None,
     ):
-        scheduler = None
+        # Register signal handler to ensure finally block execution on terminate
+        def _worker_sig_handler(signum, frame):
+            sys.exit(0)
+        signal.signal(signal.SIGTERM, _worker_sig_handler)
+        
+        # Set MASTER_ADDR and MASTER_PORT inside worker
+        os.environ["MASTER_ADDR"] = "localhost"
+        if master_port is not None:
+            os.environ["MASTER_PORT"] = str(master_port)
+        elif "MASTER_PORT" not in os.environ:
+            raise RuntimeError("MASTER_PORT must be provided or set in environment")
+        
+        dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
+        torch.cuda.set_device(rank)
+
+        port_args = PortArgs.init_new(server_args)
+        scheduler = Scheduler(
+            server_args=server_args,
+            port_args=port_args,
+            gpu_id=rank,
+            tp_rank=rank,
+            dp_rank=0,
+            moe_ep_rank=0,
+            pp_rank=0, # Pipeline parallelism is not Supported
+            llm_kvcache_size=llm_kvcache_size,
+        )
+        # Setup system SUB socket on rank 0
+        if req_port is not None:
+            ctx = zmq.Context.instance()
+            sub_socket = ctx.socket(zmq.SUB)
+            sub_socket.setsockopt(zmq.LINGER, 0)
+            sub_socket.connect(f"tcp://127.0.0.1:{req_port}")
+            sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
+            poller = zmq.Poller()
+            poller.register(sub_socket, zmq.POLLIN)
+            scheduler.receive_from_system = sub_socket
+        else:
+            scheduler.receive_from_system = None
+
+        # Initialize switching strategy
+        router = create_switching_strategy(switching_strategy, **strategy_kwargs)
+
+        # Notify readiness after subscription
+        if ready_queue is not None:
+            try:
+                ready_queue.put(("READY", rank, scheduler.tokenizer if rank == 0 else None))
+            except Exception as e:
+                print(f"SLMServer Failed to send tokenizer from rank {rank}: {e}")
+
+        print(f"Quick model worker {rank} started, waiting for requests...")
+
+        SLMServer.init_batch_not_need(scheduler)
+        pbar_dict = {}
+
+        # event_loop
         try:
-            # Register signal handler to ensure finally block execution on terminate
-            def _worker_sig_handler(signum, frame):
-                sys.exit(0)
-            signal.signal(signal.SIGTERM, _worker_sig_handler)
-
-            # Set MASTER_ADDR and MASTER_PORT inside worker
-            os.environ["MASTER_ADDR"] = "localhost"
-            if master_port is not None:
-                os.environ["MASTER_PORT"] = str(master_port)
-            elif "MASTER_PORT" not in os.environ:
-                raise RuntimeError("MASTER_PORT must be provided or set in environment")
-
-            dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-            torch.cuda.set_device(rank)
-
-            port_args = PortArgs.init_new(server_args)
-            scheduler = Scheduler(
-                server_args=server_args,
-                port_args=port_args,
-                gpu_id=rank,
-                tp_rank=rank,
-                dp_rank=0,
-                moe_ep_rank=0,
-                pp_rank=0, # Pipeline parallelism is not Supported
-                llm_kvcache_size=llm_kvcache_size,
-                min_batch_size=min_batch_size,
-            )
-            # Setup system SUB socket on rank 0
-            if req_port is not None:
-                ctx = zmq.Context.instance()
-                sub_socket = ctx.socket(zmq.SUB)
-                sub_socket.setsockopt(zmq.LINGER, 0)
-                sub_socket.connect(f"tcp://127.0.0.1:{req_port}")
-                sub_socket.setsockopt(zmq.SUBSCRIBE, b"")
-                poller = zmq.Poller()
-                poller.register(sub_socket, zmq.POLLIN)
-                scheduler.receive_from_system = sub_socket
-            else:
-                scheduler.receive_from_system = None
-
-            # Initialize switching strategy
-            router = create_switching_strategy(switching_strategy, **strategy_kwargs)
-
-            # Notify readiness after subscription
-            if ready_queue is not None:
-                try:
-                    ready_queue.put(("READY", rank, scheduler.tokenizer if rank == 0 else None))
-                except Exception as e:
-                    print(f"SLMServer Failed to send tokenizer from rank {rank}: {e}")
-
-            print(f"Quick model worker {rank} started, waiting for requests...")
-
-            SLMServer.init_batch_not_need(scheduler)
-            pbar_dict = {}
-
-            # event_loop
             while True:
                 init_nvtx = False
                 if inbound_queue is not None: # Process message from LLM
@@ -366,17 +538,48 @@ class SLMServer:
                     if llm_reqs:
                         nvtx.push_range("SLM")
                         init_nvtx = True
-                        SLMServer.process_result_from_llm(
-                            rank,
-                            scheduler,
-                            llm_reqs,
-                            router,
-                            finished_queue,
-                            outbound_queue,
-                        )
+                        SLMServer.process_result_from_llm(rank, scheduler, llm_reqs, finished_queue, outbound_queue)
                 
                 recv_reqs = SLMServer.recv_requests(scheduler)
+                if (
+                    rank == 0
+                    and recv_reqs
+                    and os.environ.get("R2R_TRACE_REQ_FLOW", "").strip().lower() in ("1", "true", "yes", "on")
+                ):
+                    print(
+                        f"[req-recv] count={len(recv_reqs)} "
+                        f"rids={[getattr(r, 'rid', None) for r in recv_reqs[:8]]}",
+                        flush=True,
+                    )
+                if rank == 0 and recv_reqs:
+                    #region agent log
+                    _agent_debug_log(
+                        run_id=os.environ.get("R2R_DEBUG_RUN_ID", "run-unknown"),
+                        hypothesis_id="H5",
+                        location="slm_server.py:quick_model_worker_recv",
+                        message="received_reqs_from_system",
+                        data={
+                            "num_reqs": len(recv_reqs),
+                            "rids": [getattr(r, "rid", None) for r in recv_reqs[:8]],
+                            "statuses": [getattr(r, "status", None) for r in recv_reqs[:8]],
+                        },
+                    )
+                    #endregion
                 ok = SLMServer.process_new_requests(recv_reqs, scheduler, rank, outbound_queue)
+                if rank == 0 and recv_reqs:
+                    #region agent log
+                    _agent_debug_log(
+                        run_id=os.environ.get("R2R_DEBUG_RUN_ID", "run-unknown"),
+                        hypothesis_id="H5",
+                        location="slm_server.py:quick_model_worker_post_process_new_requests",
+                        message="requests_enqueued_to_waiting_queue",
+                        data={
+                            "recv_count": len(recv_reqs),
+                            "waiting_queue_len": len(getattr(scheduler, "waiting_queue", []) or []),
+                            "batch_not_need_len": len(getattr(getattr(scheduler, "batch_not_need", None), "reqs", []) or []),
+                        },
+                    )
+                    #endregion
                 if ok is False:
                     print(f"[quick rank{rank}] SHUTDOWN received, exiting...")
                     break
@@ -389,8 +592,11 @@ class SLMServer:
                         batch,
                         scheduler,
                         router,
-                        trace_reference_for_all_positions=trace_reference_for_all_positions,
-                        default_trace_logits_topk_k=trace_logits_topk_k,
+                        entropy_lookahead_query_queue=entropy_lookahead_query_queue,
+                        entropy_lookahead_reply_queue=entropy_lookahead_reply_queue,
+                        finished_queue=finished_queue,
+                        outbound_queue=outbound_queue,
+                        rank=rank,
                     )
                     SLMServer.process_batch_results(batch, result, scheduler, finished_queue, outbound_queue, rank, req_to_send)
                     scheduler.last_batch=batch
@@ -400,14 +606,9 @@ class SLMServer:
         except (SystemExit, KeyboardInterrupt):
             pass
         except BaseException as e:
-            tb = traceback.format_exc()
-            print(f"[quick rank {rank}] fatal error during worker lifecycle: {e}")
-            print(tb)
-            if ready_queue is not None:
-                try:
-                    ready_queue.put(("ERROR", rank, tb))
-                except Exception:
-                    pass
+            print(f"[quick rank{rank}] SLM worker fatal error: {e}", flush=True)
+            import traceback as _tb
+            _tb.print_exc()
         finally:
             try:
                 if dist.is_initialized():
@@ -510,18 +711,13 @@ class SLMServer:
         return recv_reqs
 
     @staticmethod
-    def process_result_from_llm(
-        rank: int,
-        scheduler: Scheduler,
-        commit_msgs,
-        router,
-        finished_queue: Optional[mp.Queue] = None,
-        outbound_queue: Optional[mp.Queue] = None,
-    ):
-        llm_results = {}
+    def process_result_from_llm(rank: int, scheduler: Scheduler, commit_msgs, finished_queue: Optional[mp.Queue] = None, outbound_queue: Optional[mp.Queue] = None):
+        if rank == 0 and hasattr(scheduler, "n_generated_tokens"):
+            scheduler.n_generated_tokens += len(commit_msgs)
+        better_token_ids = {}
         returned_rid_list = []
         for waiting_req in commit_msgs:
-            llm_results[waiting_req.rid] = waiting_req
+            better_token_ids[waiting_req.rid] = waiting_req.new_token_ids[-1]
             returned_rid_list.append(waiting_req.rid)
         keep_indices = []
         not_keep_indices = []
@@ -534,204 +730,19 @@ class SLMServer:
             output_ids_list = []
             for i, req in enumerate(scheduler.last_batch.reqs):
                 if req.rid in returned_rid_list:
-                    llm_result = llm_results[req.rid]
-                    final_token_id = int(llm_result.new_token_ids[-1])
-                    source_model = getattr(llm_result, "final_token_source", None) or "reference"
-                    trace_index = getattr(req, "r2r_pending_trace_index", None)
-                    async_speculative = bool(
-                        getattr(req, "r2r_async_speculative_pending", False)
-                        or getattr(llm_result, "async_speculative", False)
-                    )
-
-                    if getattr(router, "requires_reference_evaluation", False):
-                        quick_token_id = getattr(req, "r2r_quick_token_id", None)
-                        distribution_mode = getattr(req, "r2r_reference_logits_mode", None)
-                        decision_mode = getattr(req, "r2r_reference_decision_mode", None)
-
-                        if decision_mode in {"llm_sparse_js", "llm_full_js", "async_llm_sparse_js"}:
-                            pass
-                        elif distribution_mode == "full":
-                            quick_logits = getattr(req, "r2r_quick_logits", None)
-                            ref_logits = llm_result.reference_logits
-                            if (
-                                quick_logits is not None
-                                and quick_token_id is not None
-                                and ref_logits is not None
-                            ):
-                                use_reference = (
-                                    router.route_with_reference_logits(
-                                        quick_logits[None, :], ref_logits[None, :]
-                                    )[0].item()
-                                    == 1
-                                )
-                                if not use_reference:
-                                    final_token_id = int(quick_token_id)
-                                    source_model = "quick"
-                        elif distribution_mode == "topk":
-                            quick_topk_indices = getattr(req, "r2r_quick_topk_indices", None)
-                            quick_topk_logits = getattr(req, "r2r_quick_topk_logits", None)
-                            ref_topk_indices = llm_result.reference_topk_indices
-                            ref_topk_logits = llm_result.reference_topk_logits
-                            if (
-                                quick_topk_indices is not None
-                                and quick_topk_logits is not None
-                                and quick_token_id is not None
-                                and ref_topk_indices is not None
-                                and ref_topk_logits is not None
-                            ):
-                                use_reference = (
-                                    router.route_with_reference_topk(
-                                        quick_topk_indices=quick_topk_indices[None, :],
-                                        quick_topk_logits=quick_topk_logits[None, :],
-                                        reference_topk_indices=ref_topk_indices[None, :],
-                                        reference_topk_logits=ref_topk_logits[None, :],
-                                    )[0].item()
-                                    == 1
-                                )
-                                if not use_reference:
-                                    final_token_id = int(quick_token_id)
-                                    source_model = "quick"
-
-                        for attr_name in (
-                            "r2r_quick_logits",
-                            "r2r_quick_token_id",
-                            "r2r_quick_topk_indices",
-                            "r2r_quick_topk_logits",
-                            "r2r_reference_logits_mode",
-                            "r2r_reference_topk_k",
-                            "r2r_reference_decision_mode",
-                            "r2r_reference_js_threshold",
-                        ):
-                            if hasattr(req, attr_name):
-                                delattr(req, attr_name)
-
-                    trace_updates = {
-                        "reference_token_id": int(
-                            getattr(
-                                llm_result,
-                                "reference_token_id",
-                                getattr(llm_result, "new_token_ids", [final_token_id])[-1],
-                            )
-                        ),
-                        "source_model": source_model,
-                        "output_token_id": final_token_id,
-                    }
-                    if getattr(llm_result, "reference_entropy", None) is not None:
-                        trace_updates["reference_entropy"] = float(
-                            llm_result.reference_entropy
-                        )
-                    if getattr(llm_result, "reference_top1_prob", None) is not None:
-                        trace_updates["reference_top1_prob"] = float(
-                            llm_result.reference_top1_prob
-                        )
-                    if getattr(llm_result, "js_divergence", None) is not None:
-                        trace_updates["js_divergence"] = float(llm_result.js_divergence)
-                        if getattr(router, "trace_router_score_from_js", False):
-                            trace_updates["router_score"] = float(llm_result.js_divergence)
-                    ref_logits = getattr(llm_result, "reference_logits", None)
-                    if ref_logits is not None:
-                        ref_logits = ref_logits.detach().cpu()
-                        trace_updates["reference_entropy"] = float(compute_entropy(ref_logits))
-                        trace_updates["reference_top1_prob"] = _get_top1_prob(ref_logits)
-                        quick_logits = getattr(req, "r2r_quick_logits", None)
-                        if quick_logits is not None:
-                            trace_updates["js_divergence"] = float(
-                                compute_js_divergence(
-                                    quick_logits[None, :],
-                                    ref_logits[None, :],
-                                )[0].item()
-                            )
-                            if getattr(router, "trace_router_score_from_js", False):
-                                trace_updates["router_score"] = trace_updates["js_divergence"]
-                        trace_logits_topk_k = int(
-                            getattr(req, "r2r_trace_logits_topk_k", 0) or 0
-                        )
-                        if trace_logits_topk_k > 0:
-                            ref_trace_topk_logits, ref_trace_topk_indices = extract_topk_logits(
-                                ref_logits,
-                                trace_logits_topk_k,
-                            )
-                            trace_updates["reference_topk_token_ids"] = (
-                                ref_trace_topk_indices.cpu().tolist()
-                            )
-                            trace_updates["reference_topk_logits"] = (
-                                ref_trace_topk_logits.to(dtype=torch.float32).cpu().tolist()
-                            )
-
-                    ref_topk_indices = getattr(llm_result, "reference_topk_indices", None)
-                    ref_topk_logits = getattr(llm_result, "reference_topk_logits", None)
-                    if ref_topk_indices is not None and ref_topk_logits is not None:
-                        ref_topk_indices = ref_topk_indices.detach().cpu()
-                        ref_topk_logits = ref_topk_logits.detach().cpu()
-                        if ref_topk_indices.numel() > 0:
-                            trace_updates["reference_token_id"] = int(ref_topk_indices[0].item())
-                        quick_topk_indices = getattr(req, "r2r_quick_topk_indices", None)
-                        quick_topk_logits = getattr(req, "r2r_quick_topk_logits", None)
-                        if quick_topk_indices is not None and quick_topk_logits is not None:
-                            trace_updates["js_divergence"] = float(
-                                compute_sparse_topk_js_divergence(
-                                    logits_p=quick_topk_logits[None, :],
-                                    indices_p=quick_topk_indices[None, :],
-                                    logits_q=ref_topk_logits[None, :],
-                                    indices_q=ref_topk_indices[None, :],
-                                )[0].item()
-                            )
-                            if getattr(router, "trace_router_score_from_js", False):
-                                trace_updates["router_score"] = trace_updates["js_divergence"]
-                    _update_trace_entry(req, trace_index, trace_updates)
-
-                    if async_speculative:
-                        provisional_token_id = getattr(
-                            req, "r2r_async_provisional_token_id", None
-                        )
-                        if provisional_token_id is None and req.output_ids:
-                            provisional_token_id = int(req.output_ids[-1])
-
-                        if req.output_ids:
-                            req.output_ids[-1] = final_token_id
-                        else:
-                            req.output_ids.append(final_token_id)
-
-                        if source_model == "reference":
-                            req.llm_token_count = getattr(req, "llm_token_count", 0) + 1
-                            req.slm_token_count = max(
-                                0, getattr(req, "slm_token_count", 0) - 1
-                            )
-                            if rank == 0 and hasattr(scheduler, "n_llm_generated_tokens"):
-                                scheduler.n_llm_generated_tokens += 1
-                            if final_token_id != provisional_token_id:
-                                # Rebuild prefix cache on the next step if speculative
-                                # quick and verified reference tokens disagree.
-                                req.reset_for_retract()
-                        else:
-                            source_model = "quick"
-                    else:
-                        req.output_ids.append(final_token_id)
-                        if source_model == "reference":
-                            req.llm_token_count = getattr(req, 'llm_token_count', 0) + 1
-                            if rank == 0 and hasattr(scheduler, "n_llm_generated_tokens"):
-                                scheduler.n_llm_generated_tokens += 1
-                        else:
-                            req.slm_token_count = getattr(req, 'slm_token_count', 0) + 1
-                            if rank == 0 and hasattr(scheduler, "n_slm_generated_tokens"):
-                                scheduler.n_slm_generated_tokens += 1
-
-                    if final_token_id in scheduler.model_config.hf_eos_token_id:
+                    if better_token_ids[req.rid] in scheduler.model_config.hf_eos_token_id:
                         scheduler.abort_request(AbortReq(req.rid))
-                    for attr_name in (
-                        "r2r_async_speculative_pending",
-                        "r2r_async_provisional_token_id",
-                        "r2r_pending_trace_index",
-                    ):
-                        if hasattr(req, attr_name):
-                            delattr(req, attr_name)
+                    req.output_ids.append(better_token_ids[req.rid])
+                    req.llm_token_count = getattr(req, 'llm_token_count', 0) + 1
+                    llm_reason = getattr(req, 'current_llm_reason', None)
+                    if llm_reason == 'window_followup' and getattr(req, 'forced_llm_window_remaining', 0) > 0:
+                        req.forced_llm_window_remaining -= 1
+                    req.current_llm_reason = None
                     req.status = "need"
                     req.check_finished()
                     if req.finished():
-                        req.status = "finished"
-                        SLMServer.cache_finished_req_compat(rank, scheduler, req)
+                        SLMServer.tree_cache_finished_req_safe(scheduler, req)
                         finished_reqs.append(req)
-                        scheduler.n_active_reqs -= 1
                     keep_indices.append(i)
                 elif req.status == "need":
                     keep_indices.append(i)
@@ -742,14 +753,6 @@ class SLMServer:
             )
             
             scheduler.last_batch.filter_batch(keep_indices=keep_indices)
-            # Requests returned from the LLM are reinserted into last_batch here.
-            # If this batch still carries the old "merged" marker from a previous
-            # scheduler cycle, get_next_batch_to_run() will skip merging it back
-            # into running_batch, leaving the request stranded in a CPU-side busy
-            # loop with no further GPU work. Clear the marker so the scheduler
-            # can re-attach the batch on the next iteration.
-            if returned_rid_list and hasattr(scheduler.last_batch, "merged"):
-                delattr(scheduler.last_batch, "merged")
             
             for i, req in enumerate(scheduler.batch_not_need.reqs):
                 if req.status == "notneed" and req.rid not in returned_rid_list:
@@ -759,43 +762,24 @@ class SLMServer:
                 SLMServer.process_finished_requests(finished_reqs, scheduler.tokenizer, finished_queue, outbound_queue)
             if finished_reqs:
                 for req in finished_reqs:
-                    scheduler.issued_reqs.remove(req)
-
-    @staticmethod
-    def cache_finished_req_compat(rank: int, scheduler: Scheduler, req: Req):
-        if req.last_node is None:
-            # Routed requests can bypass the standard decode bookkeeping path.
-            # When that happens, finish cleanup still needs to insert/free KV state,
-            # but the radix cache unlock must degrade to a root-node no-op.
-            if getattr(req, "prefix_indices", None) is None:
-                req.prefix_indices = []
-
-            root_node = getattr(scheduler.tree_cache, "root_node", None)
-            if root_node is None and hasattr(scheduler.tree_cache, "match_prefix"):
-                try:
-                    match_result = scheduler.tree_cache.match_prefix(key=[])
-                    root_node = getattr(match_result, "last_device_node", None)
-                except Exception:
-                    root_node = None
-
-            if root_node is not None:
-                req.last_node = root_node
-                if rank == 0:
-                    print(
-                        f"[quick rank{rank}] req {req.rid} finished with missing last_node; "
-                        "using root-node cleanup fallback"
-                    )
-
-        scheduler.tree_cache.cache_finished_req(req)
+                    try:
+                        scheduler.issued_reqs.remove(req)
+                    except (KeyError, ValueError):
+                        pass
+        _log_current_tokens_per_second(
+            scheduler=scheduler,
+            rank=rank,
+            source="llm",
+            token_count=len(returned_rid_list),
+        )
     
     @staticmethod
     def simple_prepare_for_extend(batch: ScheduleBatch):
-        global end_of_cache_loc
         batch.forward_mode = ForwardMode.EXTEND
 
-        # Allocate req slots
+        # Allocate req slots (must be pool indices from allocator, not req.rid — rids can be str)
         bs = len(batch.reqs)
-        req_pool_indices = [req.rid for req in batch.reqs]
+        req_pool_indices = batch.alloc_req_slots(bs)
 
         # Init tensors
         reqs = batch.reqs
@@ -823,24 +807,23 @@ class SLMServer:
             req.cached_tokens += pre_len - req.already_computed
             req.already_computed = seq_len
             req.is_retracted = False
-        # Allocate memory for multiple sequences
-        out_cache_locs = []
-        for i in range(bs):
-            start = end_of_cache_loc
-            end_of_cache_loc += extend_lens[i]
-            end = start + extend_lens[i]
-            out_cache_loc = torch.arange(
-                start=start,
-                end=end,
-                dtype=torch.int64,
-                device=batch.device,
-            )
-            out_cache_locs.append(out_cache_loc)
-        
-        if len(out_cache_locs) == 0:
+        # KV indices must come from the real allocator (a running counter overflows the pool).
+        if extend_num_tokens == 0:
             out_cache_loc = None
+        elif batch.token_to_kv_pool_allocator.page_size == 1:
+            out_cache_loc = batch.alloc_token_slots(extend_num_tokens)
         else:
-            out_cache_loc = torch.cat(out_cache_locs) if len(out_cache_locs) > 1 else out_cache_locs[0]
+            last_loc = get_last_loc(
+                batch.req_to_token_pool.req_to_token,
+                req_pool_indices_tensor,
+                prefix_lens_tensor,
+            )
+            out_cache_loc = batch.alloc_paged_token_slots_extend(
+                prefix_lens_tensor,
+                seq_lens_tensor,
+                last_loc,
+                extend_num_tokens,
+            )
 
         # Set fields
         batch.input_ids = input_ids_tensor
@@ -931,12 +914,720 @@ class SLMServer:
         return recv_reqs
 
     @staticmethod
+    def _slm_one_off_forward_logits(scheduler: Scheduler, context_ids: List[int]) -> torch.Tensor:
+        """Full-sequence extend on a throwaway Req; returns next-token logits (vocab,)."""
+        rid = f"_ela_{uuid.uuid4()}"
+        sp = SamplingParams(temperature=0.0, top_p=1.0, top_k=-1, max_new_tokens=1, stop=[])
+        sp.normalize(None)
+        req = Req(
+            rid=rid,
+            origin_input_text=scheduler.tokenizer.decode(context_ids),
+            origin_input_ids=context_ids,
+            sampling_params=sp,
+            eos_token_ids=scheduler.model_config.hf_eos_token_id,
+            return_hidden_states=False,
+            vocab_size=scheduler.model_config.vocab_size,
+        )
+        req.prefix_indices = []
+        req.output_ids = []
+        req.fill_ids = list(context_ids)
+        req.extend_input_len = len(req.fill_ids)
+        req.init_next_round_input(scheduler.tree_cache)
+        new_batch = ScheduleBatch.init_new(
+            [req],
+            scheduler.req_to_token_pool,
+            scheduler.token_to_kv_pool_allocator,
+            scheduler.tree_cache,
+            scheduler.model_config,
+            scheduler.enable_overlap,
+            scheduler.spec_algorithm,
+            scheduler.server_args.enable_custom_logit_processor,
+        )
+        if not hasattr(req, "device"):
+            req.device = new_batch.device
+        SLMServer.simple_prepare_for_extend(new_batch)
+        model_batch = new_batch.get_model_worker_batch()
+        kv_locs = new_batch.out_cache_loc
+        try:
+            result = scheduler.tp_worker.forward_batch_generation(model_batch)
+            logits_output = result[0] if isinstance(result, tuple) else result.logits_output
+            return logits_output.next_token_logits[0].float()
+        finally:
+            try:
+                if kv_locs is not None and kv_locs.numel() > 0:
+                    scheduler.token_to_kv_pool_allocator.free(kv_locs)
+            except Exception:
+                pass
+            try:
+                if getattr(req, "req_pool_idx", None) is not None:
+                    scheduler.req_to_token_pool.free(req.req_pool_idx)
+            except Exception:
+                pass
+            try:
+                scheduler.abort_request(AbortReq(rid))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _sliding_entropy_deque_for_req(req: Req, maxlen: int) -> deque:
+        dq = getattr(req, "_sliding_entropy_deque", None)
+        if dq is None or dq.maxlen != maxlen:
+            dq = deque(maxlen=maxlen)
+            req._sliding_entropy_deque = dq
+        return dq
+
+    @staticmethod
+    def _sliding_slm_logits_deque_for_req(req: Req, maxlen: int) -> deque:
+        dq = getattr(req, "_sliding_slm_logits_deque", None)
+        if dq is None or dq.maxlen != maxlen:
+            dq = deque(maxlen=maxlen)
+            req._sliding_slm_logits_deque = dq
+        return dq
+
+    @staticmethod
+    def _sliding_window_truncate_slm_suffix(req: Req, router: SlidingWindowEntropySwitching, window_offset_k: int) -> None:
+        """Drop SLM-generated tokens from the intervention index onward (prefix kept).
+
+        Before the current decode append, ``output_ids[last_llm_loc:]`` has length L;
+        the deque holds N entropies for the next-token positions ending at index L.
+        ``window_offset_k`` is the index within the deque (0 = oldest in window) of the
+        first token to replace—**leftmost index of maximum entropy** in the window.
+        Keep ``L - N + 1 + window_offset_k`` tokens of the SLM suffix.
+        """
+        n = router.window_size
+        ll = int(req.last_llm_loc) if req.last_llm_loc is not None else 0
+        slm_seg = req.output_ids[ll:]
+        L = len(slm_seg)
+        if L == 0:
+            return
+        keep = L - n + 1 + int(window_offset_k)
+        if keep < 0:
+            keep = 0
+        if keep > L:
+            keep = L
+        new_len = ll + keep
+        if new_len < len(req.output_ids):
+            del req.output_ids[new_len:]
+
+    @staticmethod
+    def _sliding_window_truncate_entire_window(req: Req, router: SlidingWindowEntropySwitching) -> None:
+        """Drop the last N SLM-generated tokens (the full rolling window span).
+
+        After this, LLM will fill in N new tokens (via N decode steps) before SLM resumes;
+        the entropy deque is empty so the window slides forward with subsequent SLM steps.
+        """
+        n = router.window_size
+        ll = int(req.last_llm_loc) if req.last_llm_loc is not None else 0
+        slm_seg = req.output_ids[ll:]
+        L = len(slm_seg)
+        if L == 0:
+            return
+        keep = max(0, L - n)
+        new_len = ll + keep
+        if new_len < len(req.output_ids):
+            del req.output_ids[new_len:]
+
+    @staticmethod
+    def _sliding_window_entropy_choices(
+        router: SlidingWindowEntropySwitching,
+        batch: ScheduleBatch,
+        logits: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        scheduler: Scheduler,
+    ) -> torch.Tensor:
+        """Main-path SLM entropies only; sliding deque of size N; scheme B: no threshold until full."""
+        _ = (scheduler, next_token_ids)  # signature matches entropy lookahead hook
+        device = logits.device
+        batch_size = logits.shape[0]
+        choices = torch.zeros(batch_size, dtype=torch.int, device=device)
+        n = router.window_size
+        for i in range(batch_size):
+            req = batch.reqs[i]
+            if not hasattr(req, "forced_llm_window_remaining"):
+                req.forced_llm_window_remaining = 0
+            if not hasattr(req, "current_llm_reason"):
+                req.current_llm_reason = None
+            if req.forced_llm_window_remaining > 0:
+                req.current_llm_reason = "window_followup"
+                choices[i] = 1
+                continue
+
+            L0 = logits[i, 0, :]
+            H = float(compute_entropy(L0.unsqueeze(0)))
+            dq = SLMServer._sliding_entropy_deque_for_req(req, n)
+            dq.append(H)
+
+            if len(dq) < n:
+                choices[i] = 0
+                req.current_llm_reason = None
+                if _log_entropy_sum_enabled():
+                    partial = list(dq)
+                    ps = float(sum(partial))
+                    pm = ps / len(partial) if partial else 0.0
+                    _maybe_log_entropy_sum(
+                        req=req,
+                        entropy_path=partial,
+                        entropy_path_sum=ps,
+                        threshold=float(router.entropy_sum_threshold),
+                        triggered=False,
+                        window_full=False,
+                        path_mean=pm,
+                        threshold_mean=float(router.entropy_mean_threshold),
+                    )
+                continue
+
+            vals = list(dq)
+            entropy_path_sum = float(sum(vals))
+            path_mean = entropy_path_sum / float(n)
+            triggered = path_mean > float(router.entropy_mean_threshold)
+            truncate_k = _leftmost_argmax_index(vals)
+
+            if _log_entropy_sum_enabled():
+                _maybe_log_entropy_sum(
+                    req=req,
+                    entropy_path=vals,
+                    entropy_path_sum=entropy_path_sum,
+                    threshold=float(router.entropy_sum_threshold),
+                    triggered=triggered,
+                    window_full=True,
+                    path_mean=path_mean,
+                    threshold_mean=float(router.entropy_mean_threshold),
+                )
+            choices[i] = 1 if triggered else 0
+            if triggered:
+                req.current_llm_reason = "window_trigger"
+                entropy_path = list(dq)
+                # Entropy at the chosen truncate anchor (leftmost argmax in window).
+                h_at_truncate = float(vals[truncate_k])
+                mode = router.intervention_mode
+                if mode == "replace_full_window":
+                    req._sliding_truncate_argmax_k = None
+                    req._sliding_full_window_truncate_once = True
+                elif getattr(router, "truncate_on_llm_trigger", False):
+                    req._sliding_truncate_argmax_k = int(truncate_k)
+                else:
+                    req._sliding_truncate_argmax_k = None
+                dq.clear()
+                if mode in ("replace_window", "replace_full_window"):
+                    req.forced_llm_window_remaining = max(0, n - 1)
+                do_trunc = bool(getattr(router, "truncate_on_llm_trigger", False))
+                rid_log = getattr(req, "rid", "?")
+                if mode == "replace_full_window":
+                    print(
+                        f"[entropy_truncate_full_window] rid={rid_log} window_size={n} "
+                        f"path_mean={float(path_mean):.6f} thr_mean={float(router.entropy_mean_threshold):.6f}",
+                        flush=True,
+                    )
+                elif do_trunc:
+                    print(
+                        f"[entropy_truncate] rid={rid_log} truncate_k={int(truncate_k)} "
+                        f"H_at_truncate={h_at_truncate:.6f} path_mean={float(path_mean):.6f}",
+                        flush=True,
+                    )
+                append_entropy_lookahead_score_log(
+                    router.score_log_path,
+                    {
+                        "event": "sliding_window_entropy_triggered",
+                        "rid": getattr(req, "rid", None),
+                        "seq_in_batch": i,
+                        "window_size": n,
+                        "entropy_path": entropy_path,
+                        "entropy_path_sum": entropy_path_sum,
+                        "entropy_path_mean": float(path_mean),
+                        "entropy_mean_threshold": float(router.entropy_mean_threshold),
+                        "entropy_sum_threshold_yaml": float(router.entropy_sum_threshold),
+                        "intervention_mode": router.intervention_mode,
+                        "truncate_on_llm_trigger": bool(
+                            getattr(router, "truncate_on_llm_trigger", False)
+                        ),
+                        "truncate_window_offset_k": int(truncate_k),
+                        "truncate_position_entropy": h_at_truncate,
+                        "truncate_mode": (
+                            "full_window"
+                            if mode == "replace_full_window"
+                            else ("argmax" if do_trunc else "none")
+                        ),
+                        "routed_to_llm": True,
+                        "main_path_only": True,
+                    },
+                )
+            else:
+                req.current_llm_reason = None
+        router.state.last_model = "reference" if choices.any().item() else "quick"
+        return choices
+
+    @staticmethod
+    def _sliding_window_entropy_js_choices(
+        router: SlidingWindowEntropyJsSwitching,
+        batch: ScheduleBatch,
+        logits: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        scheduler: Scheduler,
+        query_queue: mp.Queue,
+        reply_queue: mp.Queue,
+    ) -> torch.Tensor:
+        """Mean entropy gate on the window, then JS(SLM||LLM) left-to-right (one LLM prefill for all n logits)."""
+        _ = (scheduler, next_token_ids)
+        device = logits.device
+        batch_size = logits.shape[0]
+        choices = torch.zeros(batch_size, dtype=torch.int, device=device)
+        n = router.window_size
+        for i in range(batch_size):
+            req = batch.reqs[i]
+            if not hasattr(req, "forced_llm_window_remaining"):
+                req.forced_llm_window_remaining = 0
+            if not hasattr(req, "current_llm_reason"):
+                req.current_llm_reason = None
+            if req.forced_llm_window_remaining > 0:
+                req.current_llm_reason = "window_followup"
+                choices[i] = 1
+                continue
+
+            L0 = logits[i, 0, :]
+            H = float(compute_entropy(L0.unsqueeze(0)))
+            dq = SLMServer._sliding_entropy_deque_for_req(req, n)
+            lq = SLMServer._sliding_slm_logits_deque_for_req(req, n)
+            dq.append(H)
+            lq.append(L0.detach().cpu().float().clone())
+
+            if len(dq) < n:
+                choices[i] = 0
+                req.current_llm_reason = None
+                continue
+
+            vals = list(dq)
+            entropy_path_sum = float(sum(vals))
+            path_mean = entropy_path_sum / float(n)
+            if path_mean <= float(router.entropy_mean_threshold):
+                choices[i] = 0
+                req.current_llm_reason = None
+                continue
+
+            ll = int(req.last_llm_loc) if req.last_llm_loc is not None else 0
+            base = list(req.origin_input_ids) + list(req.output_ids[:ll])
+            slm_seg = list(req.output_ids[ll:])
+            L = len(slm_seg)
+            if L < n:
+                choices[i] = 0
+                req.current_llm_reason = None
+                continue
+
+            full_ids = base + slm_seg[:L]
+            lq_list = list(lq)
+            js_vals = []
+            first_hit = None
+            rpc_failed = False
+            err_msg = ""
+            qid = int(time.time_ns() % (1 << 62))
+            rpc = SlidingWindowJsRpc(
+                query_id=qid,
+                full_ids=full_ids,
+                base_len=len(base),
+                window_size=n,
+            )
+            query_queue.put(rpc)
+            try:
+                resp = reply_queue.get(timeout=router.rpc_timeout_s)
+            except Exception as e:
+                err_msg = str(e)
+                resp = None
+            bad = (
+                resp is None
+                or not isinstance(resp, SlidingWindowJsResp)
+                or not resp.ok
+                or len(getattr(resp, "llm_logits", []) or []) < n
+            )
+            if bad:
+                if not err_msg and resp is not None:
+                    err_msg = str(getattr(resp, "error", "") or "bad_resp")
+                elif not err_msg:
+                    err_msg = "timeout_or_bad_resp"
+                rpc_failed = True
+            else:
+                for j in range(n):
+                    llm_t = torch.as_tensor(resp.llm_logits[j]).float()
+                    if llm_t.dim() == 2:
+                        llm_t = llm_t.squeeze(0)
+                    js = compute_js_divergence_logits(
+                        torch.as_tensor(lq_list[j]).float(), llm_t
+                    )
+                    js_vals.append(js)
+                    if js > float(router.js_threshold):
+                        first_hit = j
+                        break
+
+            if rpc_failed:
+                choices[i] = 1
+                req.current_llm_reason = "window_trigger_js_rpc_fail"
+                truncate_k = 0
+                mode = router.intervention_mode
+                if mode == "replace_full_window":
+                    req._sliding_truncate_argmax_k = None
+                    req._sliding_full_window_truncate_once = True
+                else:
+                    req._sliding_truncate_argmax_k = int(truncate_k)
+                dq.clear()
+                lq.clear()
+                if mode in ("replace_window", "replace_full_window"):
+                    req.forced_llm_window_remaining = max(0, n - 1)
+                append_entropy_lookahead_score_log(
+                    router.score_log_path,
+                    {
+                        "event": "sliding_window_entropy_js_triggered",
+                        "rid": getattr(req, "rid", None),
+                        "seq_in_batch": i,
+                        "rpc_ok": False,
+                        "error": err_msg,
+                        "entropy_path_mean": float(path_mean),
+                    },
+                )
+                continue
+
+            if first_hit is None:
+                first_hit = max(range(n), key=lambda j: js_vals[j])
+
+            truncate_k = int(first_hit)
+            choices[i] = 1
+            req.current_llm_reason = "window_trigger_js"
+            mode = router.intervention_mode
+            if mode == "replace_full_window":
+                req._sliding_truncate_argmax_k = None
+                req._sliding_full_window_truncate_once = True
+            else:
+                req._sliding_truncate_argmax_k = int(truncate_k)
+            dq.clear()
+            lq.clear()
+            if mode in ("replace_window", "replace_full_window"):
+                req.forced_llm_window_remaining = max(0, n - 1)
+
+            # First LLM token can be sampled from JS prefill logits (no duplicate prefill for that step).
+            reuse_idx = 0 if mode == "replace_full_window" else int(truncate_k)
+            req._reuse_llm_first_logits = torch.as_tensor(
+                resp.llm_logits[reuse_idx], dtype=torch.float32
+            ).cpu().clone()
+
+            rid_log = getattr(req, "rid", "?")
+            print(
+                f"[entropy_js] rid={rid_log} path_mean={float(path_mean):.6f} "
+                f"js_vals={[round(x, 5) for x in js_vals]} truncate_k={truncate_k} "
+                f"js_threshold={float(router.js_threshold):.6f}",
+                flush=True,
+            )
+            append_entropy_lookahead_score_log(
+                router.score_log_path,
+                {
+                    "event": "sliding_window_entropy_js_triggered",
+                    "rid": getattr(req, "rid", None),
+                    "seq_in_batch": i,
+                    "window_size": n,
+                    "entropy_path": vals,
+                    "entropy_path_mean": float(path_mean),
+                    "entropy_mean_threshold": float(router.entropy_mean_threshold),
+                    "js_path": [float(x) for x in js_vals],
+                    "js_llm_forwards": 0 if rpc_failed else int(n),
+                    "js_threshold": float(router.js_threshold),
+                    "truncate_window_offset_k": truncate_k,
+                    "intervention_mode": router.intervention_mode,
+                    "rpc_ok": True,
+                    "routed_to_llm": True,
+                    "reuse_first_llm_token_from_js_prefill": True,
+                },
+            )
+
+        router.state.last_model = "reference" if choices.any().item() else "quick"
+        return choices
+
+    @staticmethod
+    def _entropy_variance_js_choices(
+        router: EntropyVarianceJsSwitching,
+        batch: ScheduleBatch,
+        logits: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        scheduler: Scheduler,
+        query_queue: mp.Queue,
+        reply_queue: mp.Queue,
+    ) -> torch.Tensor:
+        """Entropy gate (H > threshold), then one LLM forward for next-token logits; JS > threshold -> LLM + reuse logits."""
+        _ = (scheduler, next_token_ids)
+        device = logits.device
+        batch_size = logits.shape[0]
+        choices = torch.zeros(batch_size, dtype=torch.int, device=device)
+        _cooldown = max(0, int(os.environ.get("R2R_EVJS_COOLDOWN", "0")))
+        _log_all = os.environ.get("R2R_LOG_EVJS_ALL", "").strip().lower() in ("1", "true", "yes", "on")
+        for i in range(batch_size):
+            req = batch.reqs[i]
+            if not hasattr(req, "current_llm_reason"):
+                req.current_llm_reason = None
+            L0 = logits[i, 0, :]
+            H = float(compute_entropy(L0.unsqueeze(0)))
+            if not (H > router.entropy_threshold):
+                choices[i] = 0
+                req.current_llm_reason = None
+                if _log_all:
+                    print(
+                        f"[evjs-gate] rid={getattr(req, 'rid', '?')} "
+                        f"entropy={H:.6f} thr_entropy={float(router.entropy_threshold):.6f} "
+                        f"-> gate=SLM",
+                        flush=True,
+                    )
+                continue
+            # --- RPC cooldown: skip expensive LLM RPC for N steps after last "stay-on-SLM" ---
+            if _cooldown > 0:
+                cd_remaining = getattr(req, "_evjs_rpc_cooldown", 0)
+                if cd_remaining > 0:
+                    req._evjs_rpc_cooldown = cd_remaining - 1
+                    choices[i] = 0
+                    req.current_llm_reason = None
+                    if _log_all:
+                        print(
+                            f"[evjs-cooldown] rid={getattr(req, 'rid', '?')} "
+                            f"entropy={H:.6f} cooldown_remaining={cd_remaining - 1} "
+                            f"-> gate=SLM (skipped RPC)",
+                            flush=True,
+                        )
+                    continue
+            ctx = list(req.origin_input_ids) + list(req.output_ids)
+            qid = int(time.time_ns() % (1 << 62)) + i
+            rpc = NextTokenJsRpc(
+                query_id=qid,
+                context_ids=ctx,
+                rid=str(getattr(req, "rid", qid)),
+            )
+            query_queue.put(rpc)
+            err_msg = ""
+            try:
+                resp = reply_queue.get(timeout=router.rpc_timeout_s)
+            except Exception as e:
+                resp = None
+                err_msg = str(e)
+            bad = (
+                resp is None
+                or not isinstance(resp, NextTokenJsResp)
+                or not resp.ok
+                or (
+                    resp.llm_logits is None
+                    and (
+                        resp.llm_topk_indices is None
+                        or resp.llm_topk_probs is None
+                        or resp.llm_tail_mass is None
+                    )
+                )
+            )
+            if bad:
+                if not err_msg and resp is not None:
+                    err_msg = str(getattr(resp, "error", "") or "bad_resp")
+                elif not err_msg:
+                    err_msg = "timeout_or_bad_resp"
+                choices[i] = 0
+                req.current_llm_reason = None
+                if _cooldown > 0:
+                    req._evjs_rpc_cooldown = _cooldown * 2
+                try:
+                    query_queue.put_nowait(NextTokenJsAbortRpc(rid=str(req.rid)))
+                except Exception:
+                    pass
+                print(
+                    f"[evjs-rpc-fail] rid={getattr(req, 'rid', '?')} "
+                    f"entropy={H:.6f} thr_entropy={float(router.entropy_threshold):.6f} "
+                    f"error={err_msg} cooldown={_cooldown * 2} -> route=SLM",
+                    flush=True,
+                )
+                append_entropy_lookahead_score_log(
+                    router.score_log_path,
+                    {
+                        "event": "entropy_variance_js",
+                        "sub": "rpc_fail",
+                        "rid": getattr(req, "rid", None),
+                        "seq_in_batch": i,
+                        "entropy": H,
+                        "entropy_threshold": float(router.entropy_threshold),
+                        "error": err_msg,
+                        "routed_to_llm": False,
+                    },
+                )
+                continue
+            if resp.llm_logits is not None:
+                llm_t = torch.as_tensor(resp.llm_logits).float().flatten()
+                js = float(compute_js_divergence_logits(L0.cpu().float(), llm_t))
+            else:
+                topk_js_k = int(getattr(resp, "topk", 16) or 16)
+                js = float(
+                    compute_js_divergence_topk_union(
+                        L0.cpu().float(),
+                        q_topk_indices=list(resp.llm_topk_indices or []),
+                        q_topk_probs=list(resp.llm_topk_probs or []),
+                        q_tail_mass=float(resp.llm_tail_mass or 0.0),
+                        top_k=topk_js_k,
+                    )
+                )
+            if js > float(router.js_threshold):
+                choices[i] = 1
+                if resp.llm_logits is not None:
+                    req._reuse_llm_first_logits = llm_t.cpu().clone()
+                else:
+                    # top-k payload cannot reconstruct full-vocab logits for reuse sampling.
+                    req._reuse_llm_first_logits = None
+                req.current_llm_reason = "entropy_variance_js"
+                print(
+                    f"[evjs-switch] rid={getattr(req, 'rid', '?')} "
+                    f"entropy={H:.6f} thr_entropy={float(router.entropy_threshold):.6f} "
+                    f"js={js:.6f} thr_js={float(router.js_threshold):.6f} -> route=LLM",
+                    flush=True,
+                )
+                append_entropy_lookahead_score_log(
+                    router.score_log_path,
+                    {
+                        "event": "entropy_variance_js",
+                        "sub": "js_route",
+                        "rid": getattr(req, "rid", None),
+                        "seq_in_batch": i,
+                        "entropy": H,
+                        "entropy_threshold": float(router.entropy_threshold),
+                        "js": js,
+                        "js_threshold": float(router.js_threshold),
+                        "routed_to_llm": True,
+                        "reuse_first_llm_token_from_rpc": True,
+                    },
+                )
+            else:
+                choices[i] = 0
+                req.current_llm_reason = None
+                if _cooldown > 0:
+                    req._evjs_rpc_cooldown = _cooldown
+                try:
+                    query_queue.put_nowait(NextTokenJsAbortRpc(rid=str(req.rid)))
+                except Exception:
+                    pass
+                if _log_all:
+                    print(
+                        f"[evjs-keep] rid={getattr(req, 'rid', '?')} "
+                        f"entropy={H:.6f} thr_entropy={float(router.entropy_threshold):.6f} "
+                        f"js={js:.6f} thr_js={float(router.js_threshold):.6f} "
+                        f"cooldown={_cooldown} -> route=SLM",
+                        flush=True,
+                    )
+                append_entropy_lookahead_score_log(
+                    router.score_log_path,
+                    {
+                        "event": "entropy_variance_js",
+                        "sub": "js_below",
+                        "rid": getattr(req, "rid", None),
+                        "seq_in_batch": i,
+                        "entropy": H,
+                        "entropy_threshold": float(router.entropy_threshold),
+                        "js": js,
+                        "js_threshold": float(router.js_threshold),
+                        "routed_to_llm": False,
+                        "cooldown_set": _cooldown,
+                    },
+                )
+        router.state.last_model = "reference" if choices.any().item() else "quick"
+        return choices
+
+    @staticmethod
+    def _entropy_lookahead_choices(
+        router: EntropyLookaheadSwitching,
+        batch: ScheduleBatch,
+        logits: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        scheduler: Scheduler,
+        query_queue: mp.Queue,
+        reply_queue: mp.Queue,
+    ) -> torch.Tensor:
+        """Per-sequence S score; synchronous RPC to LLM worker (tp=1)."""
+        device = logits.device
+        batch_size = logits.shape[0]
+        choices = torch.zeros(batch_size, dtype=torch.int, device=device)
+        n = router.lookahead_steps
+        for i in range(batch_size):
+            req = batch.reqs[i]
+            L0 = logits[i, 0, :]
+            H = compute_entropy(L0.unsqueeze(0))
+            if float(H) < router.entropy_threshold:
+                choices[i] = 0
+                continue
+            t0 = int(next_token_ids[i].item())
+            base_ctx = list(req.origin_input_ids) + list(req.output_ids)
+            slm_lps = [log_prob_of_token(L0, t0)]
+            draft = [t0]
+            # Path entropies: current-step H(L0) plus one per draft extend (length 1+n).
+            entropy_path = [float(H)]
+            temp = float(req.sampling_params.temperature)
+            top_p = float(req.sampling_params.top_p)
+            top_k = int(req.sampling_params.top_k)
+            for _ in range(n):
+                ctx_k = base_ctx + draft
+                Lk = SLMServer._slm_one_off_forward_logits(scheduler, ctx_k)
+                entropy_path.append(float(compute_entropy(Lk.unsqueeze(0))))
+                tk = sample_token(Lk, temperature=temp, top_p=top_p, top_k=top_k)
+                tid = int(tk.item()) if isinstance(tk, torch.Tensor) else int(tk)
+                slm_lps.append(log_prob_of_token(Lk, tid))
+                draft.append(tid)
+            entropy_path_sum = float(sum(entropy_path))
+            contexts = [base_ctx + draft[:k] for k in range(len(draft))]
+            qid = int(time.time_ns() % (1 << 62))
+            rpc = EntropyLookaheadRpc(query_id=qid, contexts=contexts, tokens=draft)
+            query_queue.put(rpc)
+            resp = reply_queue.get(timeout=router.rpc_timeout_s)
+            if not isinstance(resp, EntropyLookaheadResp) or not resp.ok or len(resp.logprobs) != len(draft):
+                err = getattr(resp, "error", "unknown")
+                _log_entropy_lookahead_rpc_fail_throttled(err, i)
+                choices[i] = 1
+                append_entropy_lookahead_score_log(
+                    router.score_log_path,
+                    {
+                        "event": "entropy_lookahead_triggered",
+                        "rid": getattr(req, "rid", None),
+                        "seq_in_batch": i,
+                        "entropy": float(H),
+                        "entropy_path": entropy_path,
+                        "entropy_path_sum": entropy_path_sum,
+                        "entropy_threshold": float(router.entropy_threshold),
+                        "S": None,
+                        "score_threshold": float(router.score_threshold),
+                        "lookahead_steps": n,
+                        "num_scored_tokens": len(draft),
+                        "routed_to_llm": True,
+                        "rpc_ok": False,
+                        "error": str(err),
+                    },
+                )
+                continue
+            S = sum(slm_lps[j] - resp.logprobs[j] for j in range(len(draft)))
+            choices[i] = 1 if S > router.score_threshold else 0
+            append_entropy_lookahead_score_log(
+                router.score_log_path,
+                {
+                    "event": "entropy_lookahead_triggered",
+                    "rid": getattr(req, "rid", None),
+                    "seq_in_batch": i,
+                    "entropy": float(H),
+                    "entropy_path": entropy_path,
+                    "entropy_path_sum": entropy_path_sum,
+                    "entropy_threshold": float(router.entropy_threshold),
+                    "S": float(S),
+                    "score_threshold": float(router.score_threshold),
+                    "lookahead_steps": n,
+                    "num_scored_tokens": len(draft),
+                    "routed_to_llm": bool(int(choices[i].item()) == 1),
+                    "rpc_ok": True,
+                    "slm_logprobs": [float(x) for x in slm_lps],
+                    "llm_logprobs": [float(x) for x in resp.logprobs],
+                },
+            )
+        router.state.last_model = "reference" if choices.any().item() else "quick"
+        return choices
+
+    @staticmethod
     def run_batch(
         batch: ScheduleBatch,
         scheduler: Scheduler,
         router,
-        trace_reference_for_all_positions: bool = False,
-        default_trace_logits_topk_k: int = 0,
+        entropy_lookahead_query_queue: Optional[mp.Queue] = None,
+        entropy_lookahead_reply_queue: Optional[mp.Queue] = None,
+        finished_queue: Optional[mp.Queue] = None,
+        outbound_queue: Optional[mp.Queue] = None,
+        rank: int = 0,
     ):
         result = scheduler.run_batch(batch)
         batch, hidden_states, logits, next_token_ids = SLMServer.process_routing_input(batch, result)
@@ -945,145 +1636,158 @@ class SLMServer:
             logits=logits,
             hidden_states=[hidden_states],  # dummy layer dimension
             token=next_token_ids[:, None],
-            sequence_ids=[getattr(req, "rid", None) for req in batch.reqs],
-            positions=[int(len(req.output_ids)) for req in batch.reqs],
         )
-        # Use switching strategy to decide which model to use for each input
-        if getattr(router, "requires_reference_evaluation", False):
-            model_choices = router.get_reference_candidates(model_outputs).cpu()
+        if isinstance(router, EntropyLookaheadSwitching):
+            if entropy_lookahead_query_queue is not None and entropy_lookahead_reply_queue is not None:
+                model_choices = SLMServer._entropy_lookahead_choices(
+                    router,
+                    batch,
+                    logits,
+                    next_token_ids,
+                    scheduler,
+                    entropy_lookahead_query_queue,
+                    entropy_lookahead_reply_queue,
+                ).cpu()
+            else:
+                model_choices = router.route(model_outputs).cpu()
+        elif isinstance(router, SlidingWindowEntropyJsSwitching):
+            if entropy_lookahead_query_queue is not None and entropy_lookahead_reply_queue is not None:
+                model_choices = SLMServer._sliding_window_entropy_js_choices(
+                    router,
+                    batch,
+                    logits,
+                    next_token_ids,
+                    scheduler,
+                    entropy_lookahead_query_queue,
+                    entropy_lookahead_reply_queue,
+                ).cpu()
+            else:
+                model_choices = router.route(model_outputs).cpu()
+        elif isinstance(router, EntropyVarianceJsSwitching):
+            if entropy_lookahead_query_queue is not None and entropy_lookahead_reply_queue is not None:
+                model_choices = SLMServer._entropy_variance_js_choices(
+                    router,
+                    batch,
+                    logits,
+                    next_token_ids,
+                    scheduler,
+                    entropy_lookahead_query_queue,
+                    entropy_lookahead_reply_queue,
+                ).cpu()
+            else:
+                model_choices = router.route(model_outputs).cpu()
+        elif isinstance(router, SlidingWindowEntropySwitching):
+            model_choices = SLMServer._sliding_window_entropy_choices(
+                router,
+                batch,
+                logits,
+                next_token_ids,
+                scheduler,
+            ).cpu()
         else:
             model_choices = router.route(model_outputs).cpu()
         # TODO: merge router into sglang
 
+        # Check if reference model is needed for any prompt
+        reference_needed = torch.any(model_choices)
         req_to_send = []
-        reference_request = (
-            router.get_reference_distribution_request()
-            if getattr(router, "requires_reference_evaluation", False)
-            else {"mode": None, "topk_k": None, "decision_mode": None, "js_threshold": None}
-        )
-        for i, req in enumerate(batch.reqs):
-            quick_logits_cpu = logits[i, 0].detach().cpu()
-            quick_token_id = int(next_token_ids[i].item())
-            quick_entropy = float(compute_entropy(quick_logits_cpu))
-            quick_top1_prob = _get_top1_prob(quick_logits_cpu)
-            router_decision = int(model_choices[i].item())
-            trace_force_reference = bool(
-                getattr(req, "r2r_trace_reference_for_all_positions", False)
-                or trace_reference_for_all_positions
-            )
-            trace_logits_topk_k = int(
-                getattr(req, "r2r_trace_logits_topk_k", 0) or default_trace_logits_topk_k
-            )
-            router_threshold = getattr(router, "threshold", None)
-            if router_threshold is None:
-                router_threshold = getattr(router, "entropy_threshold", None)
-            if router_threshold is None:
-                router_threshold = getattr(router, "js_threshold", None)
+        if reference_needed:
+            for i, req in enumerate(batch.reqs):
+                if model_choices[i] == 1:
+                    req.status = "notneed"
+                    did_truncate = False
+                    if isinstance(router, SlidingWindowEntropyJsSwitching):
+                        if getattr(req, "_sliding_full_window_truncate_once", False):
+                            SLMServer._sliding_window_truncate_entire_window(req, router)
+                            req._sliding_full_window_truncate_once = False
+                            did_truncate = True
+                        else:
+                            k_trunc = getattr(req, "_sliding_truncate_argmax_k", None)
+                            if k_trunc is not None:
+                                SLMServer._sliding_window_truncate_slm_suffix(
+                                    req, router, int(k_trunc)
+                                )
+                                req._sliding_truncate_argmax_k = None
+                                did_truncate = True
+                    elif isinstance(router, SlidingWindowEntropySwitching):
+                        if getattr(req, "_sliding_full_window_truncate_once", False):
+                            SLMServer._sliding_window_truncate_entire_window(req, router)
+                            req._sliding_full_window_truncate_once = False
+                            did_truncate = True
+                        elif getattr(router, "truncate_on_llm_trigger", False):
+                            k_trunc = getattr(req, "_sliding_truncate_argmax_k", None)
+                            if k_trunc is not None:
+                                SLMServer._sliding_window_truncate_slm_suffix(
+                                    req, router, int(k_trunc)
+                                )
+                                req._sliding_truncate_argmax_k = None
+                                did_truncate = True
+                    if isinstance(router, SlidingWindowEntropySwitching) and req.last_llm_loc is not None:
+                        req.last_llm_loc = min(int(req.last_llm_loc), len(req.output_ids))
 
-            trace_entry = {
-                "position": int(len(req.output_ids)),
-                "router_decision": router_decision,
-                "router_score": _get_router_score(router, i),
-                "router_threshold": float(router_threshold) if router_threshold is not None else None,
-                "router_name": router.__class__.__name__,
-                "quick_token_id": quick_token_id,
-                "quick_entropy": quick_entropy,
-                "quick_top1_prob": quick_top1_prob,
-                "reference_token_id": None,
-                "reference_entropy": None,
-                "reference_top1_prob": None,
-                "js_divergence": None,
-                "source_model": "quick" if router_decision == 0 else "reference",
-                "output_token_id": quick_token_id if router_decision == 0 else None,
-            }
-            if trace_logits_topk_k > 0:
-                quick_trace_topk_logits, quick_trace_topk_indices = extract_topk_logits(
-                    quick_logits_cpu,
-                    trace_logits_topk_k,
-                )
-                trace_entry["quick_topk_token_ids"] = quick_trace_topk_indices.cpu().tolist()
-                trace_entry["quick_topk_logits"] = (
-                    quick_trace_topk_logits.to(dtype=torch.float32).cpu().tolist()
-                )
-            trace_index = _append_trace_entry(req, trace_entry)
+                    reuse_logits = getattr(req, "_reuse_llm_first_logits", None)
+                    if (
+                        isinstance(router, (SlidingWindowEntropyJsSwitching, EntropyVarianceJsSwitching))
+                        and reuse_logits is not None
+                    ):
+                        sp0 = req.sampling_params
+                        tok = sample_token(
+                            reuse_logits
+                            if isinstance(reuse_logits, torch.Tensor)
+                            else torch.as_tensor(reuse_logits, dtype=torch.float32),
+                            temperature=float(sp0.temperature),
+                            top_p=float(sp0.top_p),
+                            top_k=int(sp0.top_k),
+                        )
+                        tok_i = int(tok) if isinstance(tok, int) else int(tok.item())
+                        req._reuse_llm_first_logits = None
+                        req.output_ids.append(tok_i)
+                        req.llm_token_count = getattr(req, "llm_token_count", 0) + 1
+                        if tok_i in scheduler.model_config.hf_eos_token_id:
+                            scheduler.abort_request(AbortReq(req.rid))
+                        req.check_finished()
+                        if req.finished():
+                            SLMServer.tree_cache_finished_req_safe(scheduler, req)
+                            if rank == 0:
+                                SLMServer.process_finished_requests(
+                                    [req], scheduler.tokenizer, finished_queue, outbound_queue
+                                )
+                            try:
+                                scheduler.issued_reqs.remove(req)
+                            except Exception:
+                                pass
+                            continue
 
-            if router_decision != 1 and not trace_force_reference:
-                continue
+                    new_token_ids = []
+                    if req.last_llm_loc is None:
+                        req.last_llm_loc = 0
+                        new_token_ids = list(req.origin_input_ids)
+                    new_token_ids = new_token_ids + list(req.output_ids[req.last_llm_loc :])
 
-            req.status = "notneed"
-            req.reference_eval_count = getattr(req, "reference_eval_count", 0) + 1
-            trace_topk_k = int(getattr(req, "r2r_trace_reference_topk_k", 0) or 0)
-            req.r2r_reference_logits_mode = reference_request.get("mode")
-            req.r2r_reference_topk_k = reference_request.get("topk_k")
-            req.r2r_reference_decision_mode = reference_request.get("decision_mode")
-            req.r2r_reference_js_threshold = reference_request.get("js_threshold")
-            req.r2r_pending_trace_index = trace_index
+                    st = getattr(req, "current_llm_reason", "need") or "need"
+                    llm_used = int(getattr(req, "llm_token_count", 0) or 0) > 0
+                    incremental_empty = (req.last_llm_loc is not None) and (
+                        len(req.output_ids) <= int(req.last_llm_loc)
+                    )
+                    if llm_used and (did_truncate or incremental_empty or len(new_token_ids) == 0):
+                        new_token_ids = list(req.origin_input_ids) + list(req.output_ids)
+                        st = "RETRACT_AND_PREFILL"
+                    elif st == "entropy_variance_js" and not llm_used and not did_truncate:
+                        st = "EVJS_CONTINUE"
 
-            if trace_force_reference and req.r2r_reference_logits_mode is None:
-                req.r2r_reference_logits_mode = "full"
-            if (
-                not getattr(router, "requires_reference_evaluation", False)
-                and trace_topk_k > 0
-                and req.r2r_reference_logits_mode is None
-            ):
-                req.r2r_reference_logits_mode = "topk"
-                req.r2r_reference_topk_k = trace_topk_k
-
-            req.r2r_quick_token_id = quick_token_id
-            req.r2r_use_reference_output = (router_decision == 1)
-            if req.r2r_reference_logits_mode == "full":
-                req.r2r_quick_logits = quick_logits_cpu
-            elif req.r2r_reference_logits_mode == "topk":
-                quick_topk_logits, quick_topk_indices = extract_topk_logits(
-                    logits[i, 0].detach(),
-                    req.r2r_reference_topk_k or 64,
-                )
-                req.r2r_quick_topk_indices = quick_topk_indices.cpu()
-                req.r2r_quick_topk_logits = quick_topk_logits.cpu()
-
-            new_token_ids = []
-            if req.last_llm_loc is None:
-                req.last_llm_loc = 0
-                new_token_ids = req.origin_input_ids
-            new_token_ids = new_token_ids + req.output_ids[req.last_llm_loc:]
-            req.last_llm_loc = len(req.output_ids)
-            waiting_req = WaitingReq(
-                rid=req.rid,
-                new_token_ids=new_token_ids,
-                sampling_params=SimpleSamplingParams(
-                    temperature=req.sampling_params.temperature,
-                    top_k=req.sampling_params.top_k,
-                    top_p=req.sampling_params.top_p,
-                    max_new_tokens=1,
-                ),
-                reference_logits_mode=req.r2r_reference_logits_mode,
-                reference_topk_k=req.r2r_reference_topk_k,
-                reference_decision_mode=req.r2r_reference_decision_mode,
-                reference_js_threshold=req.r2r_reference_js_threshold,
-                use_reference_output=req.r2r_use_reference_output,
-            )
-            if (
-                getattr(router, "requires_reference_evaluation", False)
-                and req.r2r_reference_logits_mode == "full"
-                and req.r2r_reference_decision_mode == "llm_full_js"
-            ):
-                waiting_req.quick_logits = quick_logits_cpu
-                waiting_req.quick_token_id = quick_token_id
-            if (
-                req.r2r_reference_logits_mode == "topk"
-                and getattr(req, "r2r_quick_topk_indices", None) is not None
-                and getattr(req, "r2r_quick_topk_logits", None) is not None
-            ):
-                waiting_req.quick_token_id = quick_token_id
-                waiting_req.quick_topk_indices = req.r2r_quick_topk_indices
-                waiting_req.quick_topk_logits = req.r2r_quick_topk_logits
-                waiting_req.async_speculative = (
-                    req.r2r_reference_decision_mode == "async_llm_sparse_js"
-                )
-            if req.r2r_reference_decision_mode == "async_llm_sparse_js":
-                req.r2r_async_speculative_pending = True
-                req.r2r_async_provisional_token_id = quick_token_id
-            req_to_send.append(waiting_req)
+                    req.last_llm_loc = len(req.output_ids)
+                    waiting_req = WaitingReq(
+                        rid=req.rid,
+                        new_token_ids=new_token_ids,
+                        sampling_params=SimpleSamplingParams(
+                            temperature=req.sampling_params.temperature,
+                            top_k=req.sampling_params.top_k,
+                            top_p=req.sampling_params.top_p,
+                            max_new_tokens=1,
+                        ),
+                        status=st,
+                    )
+                    req_to_send.append(waiting_req)
         return result, req_to_send
 
     @staticmethod
@@ -1111,36 +1815,47 @@ class SLMServer:
     
     @staticmethod
     def process_batch_results(batch: ScheduleBatch, result, scheduler: Scheduler, finished_queue: Optional[mp.Queue] = None, outbound_queue: Optional[mp.Queue] = None, rank: int = 0, req_to_send: Optional[List[WaitingReq]] = None):
+        slm_generated_tokens = batch.batch_size() - len(req_to_send)
         if rank == 0:
             if not hasattr(scheduler, "last_status_time"):
                 scheduler.last_status_time = time.perf_counter()
-            if not hasattr(scheduler, "n_slm_generated_tokens"):
-                scheduler.n_slm_generated_tokens = 0
-            if not hasattr(scheduler, "n_llm_generated_tokens"):
-                scheduler.n_llm_generated_tokens = 0
-            async_speculative_count = sum(
-                1
-                for req in batch.reqs
-                if getattr(req, "r2r_async_speculative_pending", False)
-            )
-            scheduler.n_slm_generated_tokens += (
-                batch.batch_size() - len(req_to_send) + async_speculative_count
-            )
+            if not hasattr(scheduler, "n_generated_tokens"):
+                scheduler.n_generated_tokens = 0
+            scheduler.n_generated_tokens += slm_generated_tokens
             gap_latency = time.perf_counter() - scheduler.last_status_time
-            if gap_latency > 10:
-                print(f"[quick rank{rank}] throughput: {(scheduler.n_slm_generated_tokens + scheduler.n_llm_generated_tokens) / gap_latency:.2f} tokens/s, llm_ratio: {scheduler.n_llm_generated_tokens / (scheduler.n_slm_generated_tokens + scheduler.n_llm_generated_tokens + 1e-8):.2%}")
-                scheduler.n_slm_generated_tokens = 0
-                scheduler.n_llm_generated_tokens = 0
+            iv = _tps_log_interval_s()
+            if gap_latency > iv:
+                print(
+                    f"[quick rank{rank}] throughput: {scheduler.n_generated_tokens / gap_latency:.2f} tokens/s",
+                    flush=True,
+                )
+                scheduler.n_generated_tokens = 0
                 scheduler.last_status_time = time.perf_counter()
+                if _perf_probe_enabled() and batch.reqs:
+                    parts = []
+                    for req in batch.reqs[:6]:
+                        if getattr(req, "status", None) == "notneed":
+                            continue
+                        inp = len(getattr(req, "origin_input_ids", None) or [])
+                        out = len(getattr(req, "output_ids", None) or [])
+                        parts.append(
+                            f"rid={getattr(req, 'rid', '?')} seq={inp + out} "
+                            f"slm={getattr(req, 'slm_token_count', 0)} "
+                            f"llm={getattr(req, 'llm_token_count', 0)}"
+                        )
+                    if parts:
+                        print("[R2R_PERF_PROBE] " + " | ".join(parts), flush=True)
+        _log_current_tokens_per_second(
+            scheduler=scheduler,
+            rank=rank,
+            source="slm",
+            token_count=slm_generated_tokens,
+        )
         batch.output_ids = result.next_token_ids
         finished_reqs = []
 
         for req, next_token_id in zip(batch.reqs, result.next_token_ids):
             if req.status == "notneed":
-                if getattr(req, "r2r_async_speculative_pending", False):
-                    req.output_ids.append(next_token_id.item())
-                    req.slm_token_count = getattr(req, "slm_token_count", 0) + 1
-                    req.r2r_async_provisional_token_id = int(next_token_id.item())
                 continue
             if next_token_id in scheduler.model_config.hf_eos_token_id:
                 scheduler.abort_request(AbortReq(req.rid))
@@ -1148,17 +1863,48 @@ class SLMServer:
             # Track SLM token generation
             req.slm_token_count = getattr(req, 'slm_token_count', 0) + 1
             req.check_finished()
+            cur_len = len(req.output_ids)
+            milestone = cur_len // 128
+            if rank == 0 and milestone > getattr(req, "_agent_debug_milestone", -1):
+                req._agent_debug_milestone = milestone
+                if os.environ.get("R2R_LOG_GENERATION_PREVIEW", "").strip().lower() in ("1", "true", "yes", "on"):
+                    try:
+                        tail_ids = list(req.output_ids[-24:])
+                        tail_text = scheduler.tokenizer.decode(tail_ids) if tail_ids else ""
+                        print(
+                            f"[gen-preview] rid={getattr(req, 'rid', '?')} out_len={cur_len} tail={tail_text!r}",
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
+                #region agent log
+                _agent_debug_log(
+                    run_id=os.environ.get("R2R_DEBUG_RUN_ID", "run-unknown"),
+                    hypothesis_id="H1",
+                    location="slm_server.py:process_batch_results",
+                    message="req_progress_milestone",
+                    data={
+                        "rid": getattr(req, "rid", None),
+                        "output_len": cur_len,
+                        "slm_token_count": int(getattr(req, "slm_token_count", 0)),
+                        "llm_token_count": int(getattr(req, "llm_token_count", 0)),
+                        "finished": bool(req.finished()),
+                        "status": getattr(req, "status", None),
+                    },
+                )
+                #endregion
             if req.finished():
-                req.status = "finished"
-                SLMServer.cache_finished_req_compat(rank, scheduler, req)
+                SLMServer.tree_cache_finished_req_safe(scheduler, req)
                 finished_reqs.append(req)
-                scheduler.n_active_reqs -= 1
 
         if len(finished_reqs) > 0 and rank == 0:
             SLMServer.process_finished_requests(finished_reqs, scheduler.tokenizer, finished_queue, outbound_queue)
         if len(finished_reqs) > 0:
             for req in finished_reqs:
-                scheduler.issued_reqs.remove(req)
+                try:
+                    scheduler.issued_reqs.remove(req)
+                except (KeyError, ValueError):
+                    pass
         if len(req_to_send) > 0:
             scheduler.check_batch_status(batch)
             if rank == 0:
@@ -1182,7 +1928,6 @@ class SLMServer:
             if finished_queue is not None:
                 slm_count = getattr(req, 'slm_token_count', 0)
                 llm_count = getattr(req, 'llm_token_count', 0)
-                reference_eval_count = getattr(req, "reference_eval_count", 0)
                 total_count = slm_count + llm_count
                 payload = {
                     "rid": getattr(req, "rid", None),
@@ -1193,10 +1938,22 @@ class SLMServer:
                     "status": "finished",
                     "slm_token_count": slm_count,
                     "llm_token_count": llm_count,
-                    "reference_eval_count": reference_eval_count,
                     "llm_ratio": llm_count / total_count if total_count > 0 else 0.0,
-                    "token_trace": list(getattr(req, "r2r_token_trace", [])),
                 }
+                #region agent log
+                _agent_debug_log(
+                    run_id=os.environ.get("R2R_DEBUG_RUN_ID", "run-unknown"),
+                    hypothesis_id="H4",
+                    location="slm_server.py:process_finished_requests",
+                    message="req_marked_finished",
+                    data={
+                        "rid": payload.get("rid"),
+                        "output_len": len(payload.get("output_ids", [])),
+                        "slm_token_count": int(slm_count),
+                        "llm_token_count": int(llm_count),
+                    },
+                )
+                #endregion
                 try:
                     finished_queue.put_nowait(payload)
                 except Exception:

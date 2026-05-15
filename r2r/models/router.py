@@ -38,6 +38,12 @@ def load_config_from_folder(folder_path: str) -> dict:
     }
 ################ Model Registry, Saving and Loading #################
 MODEL_REGISTRY = {}
+from .multitask_js_router import RouterMultiTaskFFN4
+from .multitask_js_router import RouterMultiTaskFFN4, RouterBottleneck2Block, RouterBottleneck3Block, RouterBottleneck3BlockV7
+MODEL_REGISTRY["RouterMultiTaskFFN4"] = RouterMultiTaskFFN4
+MODEL_REGISTRY["RouterBottleneck2Block"] = RouterBottleneck2Block
+MODEL_REGISTRY["RouterBottleneck3Block"] = RouterBottleneck3Block
+MODEL_REGISTRY["RouterBottleneck3BlockV7"] = RouterBottleneck3BlockV7
 
 
 def register_model(cls=None, name=None):

@@ -105,7 +105,13 @@ async def lifespan(app: FastAPI):
         strategy_kwargs = {"model_path": router_path}
 
         # Threshold loading logic
-        if switching_strategy == "neural":
+        if switching_strategy in {
+            "neural",
+            "entropy_neural",
+            "entropy_then_neural",
+            "entropy_neural_multitask_js",
+            "entropy_then_neural_multitask_js",
+        }:
             # Priority: config file's router.threshold > command line arg
             threshold = router_config.get("threshold")
             if threshold is None and server_args.threshold is not None:
@@ -114,23 +120,22 @@ async def lifespan(app: FastAPI):
             if threshold is not None:
                 strategy_kwargs["threshold"] = threshold
                 print(f"Using neural threshold: {threshold}")
-        else:
-            # For non-neural strategies, use specific thresholds from config
-            if "aleatoric_threshold" in router_config:
-                strategy_kwargs["aleatoric_threshold"] = router_config["aleatoric_threshold"]
-                print(f"Using aleatoric threshold from config: {router_config['aleatoric_threshold']}")
-            
-            if "entropy_threshold" in router_config:
-                strategy_kwargs["entropy_threshold"] = router_config["entropy_threshold"]
-                print(f"Using entropy threshold from config: {router_config['entropy_threshold']}")
 
-            if "js_threshold" in router_config:
-                strategy_kwargs["js_threshold"] = router_config["js_threshold"]
-                print(f"Using js threshold from config: {router_config['js_threshold']}")
+        if "aleatoric_threshold" in router_config:
+            strategy_kwargs["aleatoric_threshold"] = router_config["aleatoric_threshold"]
+            print(f"Using aleatoric threshold from config: {router_config['aleatoric_threshold']}")
+        
+        if "entropy_threshold" in router_config:
+            strategy_kwargs["entropy_threshold"] = router_config["entropy_threshold"]
+            print(f"Using entropy threshold from config: {router_config['entropy_threshold']}")
 
-            if "js_topk" in router_config:
-                strategy_kwargs["js_topk"] = router_config["js_topk"]
-                print(f"Using js top-k from config: {router_config['js_topk']}")
+        if "js_threshold" in router_config:
+            strategy_kwargs["js_threshold"] = router_config["js_threshold"]
+            print(f"Using js threshold from config: {router_config['js_threshold']}")
+
+        if "js_topk" in router_config:
+            strategy_kwargs["js_topk"] = router_config["js_topk"]
+            print(f"Using js top-k from config: {router_config['js_topk']}")
 
         try:
             system = SLDisaggregationSystem(

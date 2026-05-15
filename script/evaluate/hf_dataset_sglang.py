@@ -90,6 +90,8 @@ _SWITCHING_STRATEGY_ALIASES = {
     "entropydrift": "entropy_drift",
     "entropy_then_neural": "entropy_neural",
     "entropytechneural": "entropy_neural",
+    "entropy_then_neural_multitask_js": "entropy_neural_multitask_js",
+    "entropytechneuralmultitaskjs": "entropy_neural_multitask_js",
 }
 
 
@@ -310,14 +312,17 @@ def parse_args():
     # Store dataset config in args for easy access
     args.dataset_config_dict = dataset_config
     
-    # Load router_path and threshold from r2r configs
-    if args.dataset in R2R_CONFIGS:
+    # Neural router threshold: YAML router > dataset r2r default (CLI --threshold wins if set).
+    router_cfg = (model_config or {}).get("router") or {}
+    if args.threshold is None and router_cfg.get("threshold") is not None:
+        args.threshold = float(router_cfg["threshold"])
+        print(f"Using neural threshold from router YAML: {args.threshold}")
+    elif args.dataset in R2R_CONFIGS:
         r2r_config = R2R_CONFIGS[args.dataset]
-        # Handle threshold (only load if not provided)
-        if args.threshold is None and 'threshold' in r2r_config:
-            args.threshold = r2r_config['threshold']
+        if args.threshold is None and "threshold" in r2r_config:
+            args.threshold = r2r_config["threshold"]
             print(f"Using threshold from r2r config: {args.threshold}")
-    
+
     if args.split_jobs and 'job' not in args.output_dir and args.job_id >= 0:
         args.output_dir = os.path.join(args.output_dir, f'job_{args.job_id}')
     
@@ -442,7 +447,23 @@ def process_with_model(
         if router_path:
             print(f"Using router path from config: {router_path}")
         
-        if switching_strategy == 'rolling':
+        if switching_strategy == 'multitask_js_router':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'pretrained_model_name': router_config.get('pretrained_model_name'),
+            })
+            threshold = router_config.get("threshold")
+            if threshold is not None:
+                strategy_kwargs["threshold"] = float(threshold)
+            entropy_threshold = router_config.get("entropy_threshold")
+            if entropy_threshold is not None:
+                strategy_kwargs["entropy_threshold"] = float(entropy_threshold)
+            else:
+                strategy_kwargs["entropy_threshold"] = None
+            entropy_topk_k = router_config.get("entropy_topk_k")
+            if entropy_topk_k is not None:
+                strategy_kwargs["entropy_topk_k"] = int(entropy_topk_k)
+        elif switching_strategy == 'rolling':
             strategy_kwargs.update({
                 'window_size': args.window_size if hasattr(args, 'window_size') else 10,
                 'required_simple_ratio': args.required_simple_ratio if hasattr(args, 'required_simple_ratio') else 0.5
@@ -499,6 +520,14 @@ def process_with_model(
                 strategy_kwargs["threshold"] = neural_threshold
             if args.is_record:
                 strategy_kwargs["use_cuda_graph"] = False
+        elif switching_strategy == 'entropy_neural_multitask_js':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'entropy_threshold': router_config.get("entropy_threshold", 0.45),
+                'pretrained_model_name': router_config.get("pretrained_model_name"),
+            })
+            if router_config.get("threshold") is not None:
+                strategy_kwargs["threshold"] = float(router_config["threshold"])
         elif switching_strategy == 'entropy_drift':
             strategy_kwargs.update({
                 'model_path': router_path,
@@ -617,9 +646,9 @@ def process_with_model(
             switching_strategy=switching_strategy,
             strategy_kwargs=strategy_kwargs,
             is_record=args.is_record,
-            trace_reference_topk_k=args.trace_reference_topk_k,
-            trace_reference_for_all_positions=args.trace_reference_for_all_positions,
-            trace_logits_topk_k=args.trace_logits_topk_k,
+            # trace_reference_topk_k=args.trace_reference_topk_k,
+            # trace_reference_for_all_positions=args.trace_reference_for_all_positions,
+            # trace_logits_topk_k=args.trace_logits_topk_k,
             **kwargs_init
         )
     else:
@@ -1476,9 +1505,9 @@ def main():
     else:
         if args.dataset_config:
             print(f"Using dataset config: {args.dataset_config}")
-            dataset = load_dataset(args.dataset_path, args.dataset_config)
+            dataset = load_dataset(args.dataset_path, args.dataset_config, download_mode="reuse_cache_if_exists")
         else:
-            dataset = load_dataset(args.dataset_path)
+            dataset = load_dataset(args.dataset_path, download_mode="reuse_cache_if_exists")
     
     print(f"Preprocessing dataset as {args.dataset_config_dict['name']}")
         
