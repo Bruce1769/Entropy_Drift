@@ -1,0 +1,39 @@
+{
+  "special_tokens": {
+    "think_start": 151648,
+    "think_end": 151649
+  },
+  "quick": {
+    "model_name": "DeepSeek-R1-Distill-Qwen-1.5B",
+    "model_path": "/gpfs/work/cpt/zhaodongwu20/models/DeepSeek-R1-Distill-Qwen-1.5B",
+    "param": "1.5",
+    "mem_fraction_static": 0.3
+  },
+  "reference": {
+    "model_name": "DeepSeek-R1-Distill-Qwen-32B",
+    "model_path": "/gpfs/work/cpt/zhaodongwu20/models/DeepSeek-R1-Distill-Qwen-32B",
+    "param": "32",
+    "mem_fraction_static": 0.85
+  },
+  "continuation_main": {
+    "model_name": "DeepSeek-R1-Distill-Qwen-32B",
+    "model_path": "/gpfs/work/cpt/zhaodongwu20/models/DeepSeek-R1-Distill-Qwen-32B",
+    "param": "32",
+    "tp_size": 1,
+    "base_gpu_id": 1,
+    "mem_fraction_static": 0.85
+  },
+  "continuation_reference": {
+    "model_name": "DeepSeek-R1-Distill-Qwen-32B",
+    "model_path": "/gpfs/work/cpt/zhaodongwu20/models/DeepSeek-R1-Distill-Qwen-32B",
+    "param": "32",
+    "tp_size": 1,
+    "base_gpu_id": 1,
+    "mem_fraction_static": 0.85
+  },
+  "router": {
+    "router_name": "entropy_e06",
+    "switching_strategy": "entropy",
+    "entropy_threshold": 0.6
+  }
+}

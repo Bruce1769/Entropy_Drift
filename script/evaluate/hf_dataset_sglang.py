@@ -548,6 +548,18 @@ def process_with_model(
                 'entropy_threshold': router_config.get("entropy_threshold", args.threshold),
                 'entropy_topk_k': router_config.get("entropy_topk_k", args.entropy_topk_k if args.entropy_topk_k is not None else 100),
             })
+        elif switching_strategy == 'entropy_topk_neural':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'entropy_threshold': router_config.get("entropy_threshold", 0.6),
+                'entropy_topk_k': router_config.get("entropy_topk_k", 100),
+                'use_cuda_graph': True,
+            })
+            neural_threshold = router_config.get("threshold")
+            if neural_threshold is None:
+                neural_threshold = args.threshold
+            if neural_threshold is not None:
+                strategy_kwargs["neural_threshold"] = neural_threshold
         elif switching_strategy == 'js':
             strategy_kwargs.update({
                 'model_path': router_path,
@@ -595,6 +607,14 @@ def process_with_model(
                 'entropy_threshold': router_config.get("entropy_threshold", 0.45),
                 'js_threshold': router_config.get("js_threshold", 0.2),
                 'js_topk': router_config.get("js_topk", 64),
+            })
+        elif switching_strategy == 'multitask_js_router':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'threshold': router_config.get("threshold", 0.5),
+                'entropy_threshold': router_config.get("entropy_threshold", 0.6),
+                'entropy_topk_k': router_config.get("entropy_topk_k", 100),
+                'pretrained_model_name': router_config.get("pretrained_model_name"),
             })
         elif switching_strategy == 'immediate':
             strategy_kwargs.update({

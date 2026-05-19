@@ -205,6 +205,8 @@ class SLDisaggregationSystem:
         # ZMQ PUB socket (broadcast producer) so all TP ranks receive the same message
         self.zmq_ctx = zmq.Context.instance()
         self.req_sender = self.zmq_ctx.socket(zmq.PUB)
+        self.req_sender.setsockopt(zmq.SNDHWM, 0)  # unlimited, prevent blocking on slow subscriber
+        self.req_sender.setsockopt(zmq.LINGER, 0)
         self.req_port = self.req_sender.bind_to_random_port("tcp://127.0.0.1")
 
         self._quick_ready_queue = mp.Queue()
@@ -531,6 +533,7 @@ class SLDisaggregationSystem:
             )
             req.display_progress = display_progress
             # Send Req object to worker process via ZMQ
+            print(f"[DBG-MAIN] send Req rid={req.rid}", flush=True)
             try:
                 self.req_sender.send_pyobj(req, flags=zmq.NOBLOCK)
             except zmq.Again:

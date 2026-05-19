@@ -33,8 +33,15 @@ DEFAULT_MMLU_INITIAL_PROMPT = (
 def check_answer_correctness(predicted: str, actual: str, answer_type: str) -> bool:
     """Check if the predicted answer is correct based on the answer type."""
     if answer_type == "boxed":
-        # For boxed numerical answers, compare as strings to allow for formatting differences
-        return str(predicted).strip() == str(actual).strip()
+        # For boxed numerical answers, compare extracted content
+        # The predicted is already extracted from \boxed{...}, but actual may still have the wrapper
+        pred_str = str(predicted).strip()
+        actual_str = str(actual).strip()
+        # Strip \boxed{...} wrapper from actual if present
+        m = re.search(r"\\boxed{([^}]*)}", actual_str)
+        if m:
+            actual_str = m.group(1).strip()
+        return pred_str == actual_str
     elif answer_type == "multiple_choice":
         # For multiple choice, compare uppercase letters
         return predicted.upper() == actual.upper()

@@ -1,11 +1,11 @@
 {
     "aime":{
         "router_path": "resource/default_router.pt",
-        "threshold": 0.40595959595959596
+        "threshold": 0.843
     },
     "aime24":{
         "router_path": "resource/default_router.pt",
-        "threshold": 0.40595959595959596
+        "threshold": 0.843
     },
     "aime26":{
         "router_path": "resource/default_router.pt",
