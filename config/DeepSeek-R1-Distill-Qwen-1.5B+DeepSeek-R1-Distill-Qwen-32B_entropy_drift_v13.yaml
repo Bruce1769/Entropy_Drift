@@ -1,0 +1,62 @@
+{
+  "special_tokens": {
+    "think_start": 151648,
+    "think_end": 151649
+  },
+  "quick": {
+    "model_name": "DeepSeek-R1-Distill-Qwen-1.5B",
+    "model_path": "/gpfs/work/cpt/zhaodongwu20/models/DeepSeek-R1-Distill-Qwen-1.5B",
+    "param": "1.5",
+    "mem_fraction_static": 0.3
+  },
+  "reference": {
+    "model_name": "DeepSeek-R1-Distill-Qwen-32B",
+    "model_path": "/gpfs/work/cpt/zhaodongwu20/models/DeepSeek-R1-Distill-Qwen-32B",
+    "param": "32",
+    "mem_fraction_static": 0.85
+  },
+  "continuation_main": {
+    "model_name": "DeepSeek-R1-Distill-Qwen-32B",
+    "model_path": "/gpfs/work/cpt/zhaodongwu20/models/DeepSeek-R1-Distill-Qwen-32B",
+    "param": "32",
+    "tp_size": 2,
+    "base_gpu_id": 2,
+    "mem_fraction_static": 0.90
+  },
+  "continuation_reference": {
+    "model_name": "DeepSeek-R1-Distill-Qwen-32B",
+    "model_path": "/gpfs/work/cpt/zhaodongwu20/models/DeepSeek-R1-Distill-Qwen-32B",
+    "param": "32",
+    "tp_size": 1,
+    "base_gpu_id": 3,
+    "mem_fraction_static": 0.90
+  },
+  "verify": {
+    "model_name": "Qwen2.5-72B-Instruct",
+    "model_path": "Qwen/Qwen2.5-72B-Instruct",
+    "mem_fraction_static": 0.90,
+    "max_new_tokens": 16,
+    "base_gpu_id": 4,
+    "tp_size": 4
+  },
+  "router": {
+    "router_name": "DeepSeek-R1-Distill-Qwen-1.5B+DeepSeek-R1-Distill-Qwen-32B",
+    "router_path": "/gpfs/home/cpt/zhaodongwu20/v13_best.pt",
+    "switching_strategy": "entropy_drift_v13",
+    "alpha": 0.3,
+    "bias": 0.5,
+    "tau": 0.5,
+    "warmup_steps": 10,
+    "hysteresis": 0.05,
+    "hold_tokens": 3,
+    "max_confident_prob": 0.95,
+    "min_entropy": 0.1,
+    "stochastic": false,
+    "entropy_topk_k": 100,
+    "entropy_threshold": 0.6,
+    "random_seed": 42,
+    "override_init_args": {
+      "pretrained_model_name": "/gpfs/work/cpt/zhaodongwu20/models/DeepSeek-R1-Distill-Qwen-1.5B"
+    }
+  }
+}

@@ -26,6 +26,7 @@
 *.whl
 *.sh
 !test/test_speed.sh
+!script/evaluate/sbatch_*.sh
 *.svg
 *.code-workspace
 *.parquet

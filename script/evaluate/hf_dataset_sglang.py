@@ -92,6 +92,9 @@ _SWITCHING_STRATEGY_ALIASES = {
     "entropytechneural": "entropy_neural",
     "entropy_then_neural_multitask_js": "entropy_neural_multitask_js",
     "entropytechneuralmultitaskjs": "entropy_neural_multitask_js",
+    "entropydriftv13": "entropy_drift_v13",
+    "entropy_drift_multitask": "entropy_drift_v13",
+    "drift_v13": "entropy_drift_v13",
 }
 
 
@@ -542,6 +545,28 @@ def process_with_model(
                 'min_entropy': args.drift_min_entropy if args.drift_min_entropy is not None else router_config.get("min_entropy"),
                 'stochastic': True if args.drift_stochastic else router_config.get("stochastic", True),
             })
+        elif switching_strategy == 'entropy_drift_v13' or switching_strategy == 'entropy_drift_multitask_js_router':
+            strategy_kwargs.update({
+                'model_path': router_path,
+                'alpha': args.drift_alpha if args.drift_alpha is not None else router_config.get("alpha", 0.1),
+                'bias': args.drift_bias if args.drift_bias is not None else router_config.get("bias", 0.0),
+                'tau': args.drift_tau if args.drift_tau is not None else router_config.get("tau", 0.5),
+                'warmup_steps': args.drift_warmup_steps if args.drift_warmup_steps is not None else router_config.get("warmup_steps", 10),
+                'random_seed': args.drift_random_seed if args.drift_random_seed is not None else router_config.get("random_seed", 42),
+                'hysteresis': args.drift_hysteresis if args.drift_hysteresis is not None else router_config.get("hysteresis", 0.0),
+                'hold_tokens': args.drift_hold_tokens if args.drift_hold_tokens is not None else router_config.get("hold_tokens", 0),
+                'max_confident_prob': args.drift_max_confident_prob if args.drift_max_confident_prob is not None else router_config.get("max_confident_prob"),
+                'min_entropy': args.drift_min_entropy if args.drift_min_entropy is not None else router_config.get("min_entropy"),
+                'stochastic': True if args.drift_stochastic else router_config.get("stochastic", True),
+                'entropy_topk_k': router_config.get("entropy_topk_k", 100),
+                'entropy_threshold': router_config.get("entropy_threshold", 0.6),
+                'pretrained_model_name': router_config.get("pretrained_model_name"),
+            })
+            threshold = router_config.get("threshold")
+            if threshold is not None:
+                strategy_kwargs["threshold"] = float(threshold)
+            if router_config.get("override_init_args"):
+                strategy_kwargs["override_init_args"] = router_config["override_init_args"]
         elif switching_strategy == 'entropy_topk':
             strategy_kwargs.update({
                 'model_path': router_path,
